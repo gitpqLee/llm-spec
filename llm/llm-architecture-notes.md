@@ -201,6 +201,58 @@ hidden   x  : [B, T, D]
        K (Key)   = "每个位置有什么信息可以提供？"
        V (Value) = "如果匹配上了，实际传递什么内容？"
 
+### Causal Mask（因果掩码）
+
+在 decoder-only 模型中，**每个 token 只能看到它自己和它之前的 token，不能"偷看"未来**。这通过在 attention score 上加一个因果掩码来实现。
+
+#### 为什么需要？
+
+语言模型的训练目标是"预测下一个 token"。如果位置 $t$ 能看到位置 $t+1$ 的信息，就相当于考试时看到了答案——模型不需要学习任何东西，直接抄就行了。因果掩码强制模型只能从"过去"中学习规律。
+
+#### 具体做法
+
+Attention score 矩阵 $S = QK^T / \sqrt{d_h}$ 的形状是 $[T \times T]$，其中 $S_{ij}$ 表示位置 $i$ 对位置 $j$ 的关注度。在 softmax **之前**，将所有 $j > i$ 的位置设为 $-\infty$：
+
+$$
+S_{ij}^{\text{masked}} = \begin{cases} S_{ij} & \text{if } j \leq i \\ -\infty & \text{if } j > i \end{cases}
+$$
+
+经过 softmax 后，$-\infty$ 变成 0，这些位置的 V 值就完全不参与加权。
+
+#### 可视化
+
+以 5 个 token 为例（✓ = 可见，✗ = 被遮挡）：
+
+```
+              Key 位置
+              t0   t1   t2   t3   t4
+         t0 [ ✓    ✗    ✗    ✗    ✗  ]   ← t0 只能看自己
+Query    t1 [ ✓    ✓    ✗    ✗    ✗  ]   ← t1 能看 t0, t1
+位置     t2 [ ✓    ✓    ✓    ✗    ✗  ]   ← t2 能看 t0~t2
+         t3 [ ✓    ✓    ✓    ✓    ✗  ]
+         t4 [ ✓    ✓    ✓    ✓    ✓  ]   ← t4 能看所有历史
+
+对应的 mask 矩阵（加到 score 上）:
+         [  0    -∞   -∞   -∞   -∞  ]
+         [  0     0   -∞   -∞   -∞  ]
+         [  0     0    0   -∞   -∞  ]
+         [  0     0    0    0   -∞  ]
+         [  0     0    0    0    0  ]
+```
+
+#### Prefill vs Decode 阶段的差异
+
+- **Prefill（首次处理整段 prompt）**：输入 $T$ 个 token，$S$ 是 $[T \times T]$，需要完整的三角 mask
+- **Decode（逐 token 生成）**：每次只有 1 个新 token 做 Q，$S$ 是 $[1 \times (T_{\text{past}}+1)]$，天然不需要 mask —— 新 token 本来就应该看到所有过去的 token
+
+#### 在 IR 中的体现
+
+OpenVINO 的 `ScaledDotProductAttention` (SDPA) op 有一个可选的 `attention_mask` 输入。对于 causal decoder 模型：
+- Prefill 时传入下三角 mask
+- Decode 时通常传入全 0 mask（或省略）
+
+在 ONNX 中，mask 通常显式地出现为一个 `Where` 或 `Add` 节点，将上三角设为一个很大的负数（如 $-10000$）。
+
 ### MHA / GQA / MQA 区别
 
 只是 K/V 的头数不同：
