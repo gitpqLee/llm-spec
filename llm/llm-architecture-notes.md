@@ -195,6 +195,12 @@ hidden   x  : [B, T, D]
    Linear  W_O   H·d_head → D                   → 输出 [B, T, D]
 ```
 
+注意力的核心公式：Attention(Q, K, V) = softmax(Q × K^T / √d) × V
+
+       Q (Query) = "我想找什么信息？"
+       K (Key)   = "每个位置有什么信息可以提供？"
+       V (Value) = "如果匹配上了，实际传递什么内容？"
+
 ### MHA / GQA / MQA 区别
 
 只是 K/V 的头数不同：
