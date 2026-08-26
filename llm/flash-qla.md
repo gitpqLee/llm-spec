@@ -217,7 +217,7 @@ Hopper 上的专用求解大致分层为：
 ### 5.1 先扣除旧状态的预测
 
 $$
-W=V-\operatorname{diag}(e^\gamma)KS_c
+W=V-\mathrm{diag}(e^\gamma)KS_c
 $$
 
 代码中可以直观理解为：
@@ -256,7 +256,7 @@ $$
 
 $$
 O_{\text{history}}
-=s\operatorname{diag}(e^\gamma)QS_c
+=s\mathrm{diag}(e^\gamma)QS_c
 $$
 
 chunk 内贡献为：
@@ -271,7 +271,7 @@ $$
 $$
 S_{c+1}
 =e^{\gamma_{C-1}}S_c
-+K^\top\operatorname{diag}
++K^\top\mathrm{diag}
 \left(e^{\gamma_{C-1}-\gamma}\right)V_d
 $$
 
