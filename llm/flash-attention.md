@@ -10,7 +10,7 @@ Attention(Q, K, V) = softmax(Q·Kᵀ / √d + M) · V
 
 四步：
 1. `S = Q·Kᵀ`：算分数矩阵 `[Lq, Lk]`
-2. `S / √d`：缩放，防止点积过大导致 softmax 退化成 one-hot
+2. `S / √d`：缩放 QK 点积的方差，减轻 softmax 饱和；数值溢出主要由减去行最大值解决
 3. softmax（对 Score 矩阵的每一行独立做）：把每个 query 对所有 key 的分数变成概率分布
 4. `P · V`：用概率加权混合 Value
 
@@ -202,7 +202,8 @@ o' = [0.1353,1]×1 + [0.6353,0.6353]×0.3679 = [0.3691, 1.2338]
 output = o'/l' = [0.3691/1.5530, 1.2338/1.5530] = [0.2377, 0.7944]  ✓
 ```
 
-**和标准答案完全一致。这不是近似，是恒等变换。**
+**在实数精确运算下与标准答案等价，不是算法近似。** 实际 kernel 因为分块改变了浮点累加顺序，
+再加上 BF16/FP16、近似指数和并行归约，结果通常不会与普通实现逐 bit 相同。
 
 ---
 
@@ -228,8 +229,11 @@ FA 的核心是沿 KV 序列方向（列方向）切块。Q 也可以切，但�
 切 Q 不需要在线 softmax 的原因：softmax 是逐行独立的，切 Q 只是把不同行分到不同块，
 每一行仍然能看到完整的 KV 序列，softmax 的输入没有被截断。
 
-FA1 不切 Q（整个 Q 参与每个 KV block 的计算）。FA2 在此基础上加了 Q 分块的外层循环，
-目的不是省内存（切 KV 已经解决了），而是提高并行度——更多 Q 块可以分配到不同计算单元上。
+上面的图和 Python 代码为了方便讲解，让整个 Q 参与每个 KV block 的计算。生产级 FA1 和 FA2
+都会把 Q 切成大小为 `Br` 的 tile，并让一个 Q tile 依次处理多个大小为 `Bc` 的 KV tile。
+
+FA2 的关键改进不是“FA1 不切 Q、FA2 才切 Q”，而是进一步改进 Q tile 的并行调度和
+warp 间工作划分，减少重复访存与非 MatMul 运算，并在 batch/head 数较少时提供更多并行任务。
 
 ---
 
@@ -243,11 +247,12 @@ FA1 不切 Q（整个 Q 参与每个 KV block 的计算）。FA2 在此基础上
 情况 3: 全 mask 块（对角线右上方）→ 直接跳过！不算 MatMul，不加载 K/V
 ```
 
-以 Lq = Lk = 1024，block_size = 256 为例：
+以对齐的方形 causal self-attention，`Lq = Lk = 1024`、`block_size = 256` 为例：
 - 没有 causal 优化：4×4 = 16 块
 - 有 causal 优化：1+2+3+4 = 10 块，省了 37.5%
 
-序列越长，省的越多（趋近 50%）。
+对于足够长、Q/K 位置对齐的方形 causal self-attention，可跳过的块比例趋近 50%。这个结论不适用于
+普通 cross-attention；decode 还需要考虑当前 query 在 KV cache 中的位置偏移，不能简单使用块内行号判断。
 
 ---
 
@@ -258,13 +263,15 @@ FA1 不切 Q（整个 Q 参与每个 KV block 的计算）。FA2 在此基础上
   Score Matrix: Lq × Lk        ← 完整物化
 
 Flash Attention:
-  Score: Lq × B                 ← 只要一块的大小，复用空间
-  m: [Lq]                       ← 每行一个 running max
-  l: [Lq]                       ← 每行一个 running sum
-  o: [Lq, dv]                   ← 每行一个 running output
+  Score tile: Br × Bc           ← Q/KV tile 的局部分数，片上复用
+  m: [Br]                        ← 当前 Q tile 每行一个 running max
+  l: [Br]                        ← 当前 Q tile 每行一个 running sum
+  o: [Br, dv]                    ← 当前 Q tile 每行一个 running output
 ```
 
-当 Lk = 8192，B = 256 时，score 空间节省 32 倍。
+标准 Attention 需要物化大小为 `Lq × Lk` 的分数/概率中间张量。FlashAttention 的主要片上
+工作空间约为 `Br × Bc + Br × dv`，并对每个 tile 复用。它主要降低中间张量的 HBM 流量，
+并没有改变 Attention 的渐近计算复杂度。
 
 ---
 
@@ -343,6 +350,10 @@ for i in range(Lq):
             S_block[i, j] = -np.inf
 ```
 
+    这段代码只用于说明位置级 mask，并没有实现“跳过整块”的性能优化。生产 kernel 会先根据 Q/K tile
+    的全局位置判断：完全有效块不做 mask，完全无效块不加载也不计算，仅对角线相交块执行逐元素 mask。
+    如果一个块对某行全部无效，还必须直接跳过或特殊处理，避免 `-inf - (-inf)` 产生 NaN。
+
 ---
 
 ## 11. 计算流程图
@@ -382,16 +393,126 @@ Finalize: output = o / l
 
 ---
 
-## 12. 面试要点总结
+## 12. FA1、FA2、FA3 的区别
+
+三代 FlashAttention 共享同一个根基：IO-aware tiling 和在线 softmax。主要差异在硬件调度，而不是
+Attention 数学公式改变。
+
+| 版本 | 主要改进 | 典型硬件重点 |
+|------|----------|--------------|
+| FA1 | 分块计算、在线 softmax，不物化完整 score/probability | 降低 HBM 读写 |
+| FA2 | 改进 Q tile 并行调度和 warp 工作划分，减少非 MatMul 开销 | 提高 occupancy 和 Tensor Core 利用率 |
+| FA3 | 异步执行、warp specialization、TMA、ping-pong pipeline，并加强低精度支持 | 面向 Hopper 等新架构 |
+
+FA3 中的 TMA、warp specialization 等不是所有 FlashAttention 实现都天然具备的能力，而是依赖具体
+GPU 架构和 kernel 实现。
+
+---
+
+## 13. Backward：用重计算换显存
+
+普通训练实现可能保存完整概率矩阵 `P`，其大小为 `Lq × Lk`。FlashAttention forward 通常只保存：
+
+- 输出 `O`；
+- 每个 query 行的 log-sum-exp，或等价的 `m/l` 统计量；
+- dropout 所需的可重现随机状态（启用 dropout 时）。
+
+Backward 再按 tile 重算：
+
+```text
+Q tile, K tile
+  ↓
+重新计算 score 和 probability
+  ↓
+结合 dO、V 计算 dQ、dK、dV
+```
+
+因此 backward 不是简单把 forward 的在线 recurrence 倒序执行，而是使用保存的行统计量恢复每个 tile
+的概率，再累计梯度。它增加了一部分重复计算，但避免保存和读取巨大的概率矩阵；在现代 GPU 上，
+多做一些 GEMM 往往比额外搬运 `O(Lq × Lk)` 数据更划算。
+
+---
+
+## 14. Prefill 与 Decode
+
+### Prefill
+
+Prefill 中 `Lq` 和 `Lk` 都较大，存在大量 Q/KV tile，可获得规则的矩阵并行和较高 Tensor Core 利用率。
+这是经典 FlashAttention kernel 最擅长的场景。
+
+### Decode
+
+逐 token decode 通常有：
+
+```text
+Lq = 1
+Lk = 已有 KV cache 长度
+```
+
+此时 Q 方向几乎没有并行度，性能更多受 KV cache 读取带宽限制。工程实现通常需要：
+
+- 将 KV 序列切给多个 CTA，再归并局部 softmax 状态（split-KV / FlashDecoding）；
+- 支持 paged KV cache；
+- 针对 MQA/GQA 避免重复读取共享 K/V；
+- 处理 query 的绝对位置偏移和 causal 边界。
+
+因此“支持 FlashAttention”不代表 prefill kernel 原样用于 decode 仍然高效。
+
+---
+
+## 15. MHA、GQA、MQA
+
+记：
+
+```text
+Q: [B, Hq, Lq, d]
+K: [B, Hkv, Lk, d]
+V: [B, Hkv, Lk, dv]
+```
+
+- MHA：`Hq = Hkv`；
+- GQA：多个 Q head 共享一个 KV head；
+- MQA：所有 Q head 共享同一个 KV head。
+
+高效 FlashAttention kernel 应在 head 映射中共享 K/V tile，而不是先把 K/V 物理复制到 `Hq` 份。
+这对 decode 尤其重要，因为此时主要成本就是读取 KV cache。详细结构参见
+[attention-mha-gqa-mqa.md](attention-mha-gqa-mqa.md)。
+
+---
+
+## 16. 复杂度与性能边界
+
+FlashAttention 的主要价值是降低 HBM 流量和中间存储，而不是降低 dense Attention 的渐近 FLOPs：
+
+```text
+计算复杂度：O(Lq × Lk × (d + dv))
+普通中间矩阵：O(Lq × Lk)
+片上 tile 工作区：O(Br × Bc + Br × dv)
+```
+
+实际速度还取决于：
+
+- tile 大小和 head dimension；
+- causal、variable-length 和 dropout；
+- batch/head 数是否足够填满 GPU；
+- 数据类型与硬件 Tensor Core 能力；
+- KV cache 是否连续、分页或量化；
+- kernel 是否针对 prefill 或 decode 调度。
+
+---
+
+## 17. 面试要点总结
 
 | 问题 | 答案 |
 |------|------|
 | FA 改了什么？ | 不改公式，改计算顺序（分块 + 在线 softmax） |
 | 为什么快？ | 减少内存读写，score 不落地到主存 |
-| 正确性？ | 恒等变换，不是近似 |
+| 正确性？ | 实数数学下等价，不是算法近似；浮点结果不保证逐 bit 相同 |
 | 三个 running state？ | max（对齐基准）、sum（分母）、output（未归一化分子） |
 | α 和 β 是什么？ | 把新旧统计量对齐到同一 max 基准的校正因子 |
 | 第一块要特殊处理吗？ | 不用，m 初始化为 -∞ 所以 α=0，旧状态自动清零 |
-| causal 怎么优化？ | 对角线右上方的整块直接跳过，省接近 50% 计算 |
-| 和 FA2 的区别？ | FA2 还沿 Q 方向切外层循环，提高 GPU 并行度 |
-| 计算量变了吗？ | 基本不变（略多校正运算），加速来自减少 IO |
+| causal 怎么优化？ | 全有效块免 mask，全无效块跳过，对角块局部 mask；方形长序列最多接近跳过一半块 |
+| 和 FA2 的区别？ | FA1/FA2 都切 Q；FA2 改善 Q tile 调度、warp 分工和硬件利用率 |
+| FA3 的重点？ | Hopper 上的异步执行、TMA、warp specialization 和流水重叠 |
+| 计算量变了吗？ | 渐近 FLOPs 基本不变，主要加速来自减少 HBM IO；backward 会重计算部分 score |
+| Decode 为什么特殊？ | `Lq=1` 缺少 Q 并行度，通常需要 split-KV/FlashDecoding 类调度 |

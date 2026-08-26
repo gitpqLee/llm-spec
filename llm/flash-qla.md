@@ -150,7 +150,143 @@ $G$ 是一个下三角矩阵，因为 causal 计算中，token $i$ 只能依赖�
 
 ### 4.2 Chunk 内依赖写成线性方程
 
-当前 token 的 delta 会受前面 token 已写入状态的影响。把这些依赖全部展开后，可以得到单位下三角系统：
+先将原始 GDN 递推拆成三步。为避免和输入 value $v_t$ 混淆，使用 $u_t$ 表示 token $t$
+最终写入状态的 corrected value：
+
+$$
+\overline S_t=\alpha_tS_{t-1}
+$$
+
+$$
+u_t=\beta_t\left(v_t-k_t\overline S_t\right)
+$$
+
+$$
+S_t=\overline S_t+k_t^\top u_t
+$$
+
+问题在于 $u_t$ 依赖 $S_{t-1}$，而 $S_{t-1}$ 已经包含前面所有 token 的 $u_i$。
+
+#### 先忽略 Gate，展开两个 Token
+
+暂时令所有 $\alpha_t=1$，设 chunk 输入状态为 $S_{\mathrm{in}}$。
+
+第 0 个 token：
+
+$$
+u_0=\beta_0\left(v_0-k_0S_{\mathrm{in}}\right)
+$$
+
+$$
+S_0=S_{\mathrm{in}}+k_0^\top u_0
+$$
+
+第 1 个 token：
+
+$$
+u_1=\beta_1\left(v_1-k_1S_0\right)
+$$
+
+代入 $S_0$：
+
+$$
+u_1=
+\beta_1\left(v_1-k_1S_{\mathrm{in}}\right)
+-\beta_1\left(k_1k_0^\top\right)u_0
+$$
+
+移项得到：
+
+$$
+\beta_1\left(k_1k_0^\top\right)u_0+u_1
+=\beta_1\left(v_1-k_1S_{\mathrm{in}}\right)
+$$
+
+定义“暂时忽略 chunk 内其他 token 时，当前 token 想写入的量”：
+
+$$
+R_t=\beta_t\left(v_t-k_tS_{\mathrm{in}}\right)
+$$
+
+两个 token 的方程可以写为：
+
+$$
+\begin{bmatrix}
+1&0\\
+\beta_1(k_1k_0^\top)&1
+\end{bmatrix}
+\begin{bmatrix}
+u_0\\u_1
+\end{bmatrix}
+=
+\begin{bmatrix}
+R_0\\R_1
+\end{bmatrix}
+$$
+
+#### 三个 Token 的结构
+
+三个 token 展开后是：
+
+$$
+\begin{aligned}
+u_0&=R_0\\
+c_{10}u_0+u_1&=R_1\\
+c_{20}u_0+c_{21}u_1+u_2&=R_2
+\end{aligned}
+$$
+
+也就是：
+
+$$
+\begin{bmatrix}
+1&0&0\\
+c_{10}&1&0\\
+c_{20}&c_{21}&1
+\end{bmatrix}
+\begin{bmatrix}
+u_0\\u_1\\u_2
+\end{bmatrix}
+=
+\begin{bmatrix}
+R_0\\R_1\\R_2
+\end{bmatrix}
+$$
+
+矩阵一定是下三角的，因为 token $t$ 只依赖更早的 token $i<t$，不会依赖未来 token。
+
+#### 加回 Gate
+
+前面 token $i$ 写入的状态传播到 token $t$ 时，需要经过累计衰减：
+
+$$
+d_{ti}=\prod_{r=i+1}^{t}\alpha_r
+=\exp\left(\gamma_t-\gamma_i\right)
+$$
+
+chunk 输入状态传播到 token $t$ 的衰减为：
+
+$$
+d_{t,\mathrm{in}}=\prod_{r=0}^{t}\alpha_r=e^{\gamma_t}
+$$
+
+因此一般形式为：
+
+$$
+u_t+
+\sum_{i<t}\beta_t d_{ti}\left(k_tk_i^\top\right)u_i
+=R_t
+$$
+
+其中：
+
+$$
+R_t=\beta_t\left(
+v_t-d_{t,\mathrm{in}}k_tS_{\mathrm{in}}
+\right)
+$$
+
+把 chunk 内全部 token 堆叠起来，就得到单位下三角系统：
 
 $$
 L V_d=R
@@ -158,9 +294,36 @@ $$
 
 其中：
 
-- $L$ 由 $K K^\top$、$\beta$ 和 causal 依赖组成；
-- $R$ 是当前 chunk 的原始 value 减去输入状态产生的预测；
-- $V_d$ 是消除了 chunk 内相互依赖后的 corrected value。
+- $V_d=[u_0,u_1,\ldots,u_{C-1}]^\top$，是所有 corrected value 堆叠成的矩阵；
+- $R$ 是只扣除 chunk 输入状态贡献、尚未处理 chunk 内 token 相互影响的写入量；
+- $L$ 记录 chunk 内 token 之间的依赖。
+
+$L$ 的元素为：
+
+$$
+L_{ti}=
+\begin{cases}
+1,&t=i\\
+\beta_t d_{ti}(k_tk_i^\top),&i<t\\
+0,&i>t
+\end{cases}
+$$
+
+每个系数的直觉是：
+
+| 因子 | 含义 |
+|------|------|
+| $\beta_t$ | 当前 token 修正预测误差的强度 |
+| $d_{ti}$ | token $i$ 的写入传播到 token $t$ 后还剩多少 |
+| $k_tk_i^\top$ | 当前 key 和历史 key 的相似程度 |
+
+因此可以把三个量理解为：
+
+```text
+R：假设 chunk 内其他 token 不存在时，每个 token 想写什么
+L：前面 token 的写入会怎样影响后面 token
+Vd：消除这些相互影响后，每个 token 最终真正应该写什么
+```
 
 于是：
 
@@ -171,6 +334,9 @@ $$
 $$
 V_d=AR
 $$
+
+不同实现可能把 $\beta$ 和部分 gate 因子吸收到 $V_d$、$R$ 或 $L$ 的不同位置，因此源码中的矩阵
+外观可能与上面的推导不完全相同，但它们都在求解同一个 causal 下三角依赖系统。
 
 这一步把：
 
