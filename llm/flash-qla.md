@@ -416,7 +416,7 @@ a_shared[2, C, C]
 缓冲区按下式交替：
 
 $$
-\text{buffer}=\text{chunk\_id}\bmod 2
+b=c_{\mathrm{id}}\bmod 2
 $$
 
 ### 9.3 时间线
