@@ -116,9 +116,9 @@ while (*workDuration == 0) {
 
 相关代码：
 
-- [DPU MatMul run/wait](../../../applications.ai.vpu-accelerators.vpux-plugin/sw_runtime_kernels/kernels/inc/dpu_shave_matmul.hpp)
-- [DPU driver start/wait](../../../applications.ai.vpu-accelerators.vpux-plugin/sw_runtime_kernels/kernels/inc/dpu_drv.hpp)
-- [GDN kernel](../../../applications.ai.vpu-accelerators.vpux-plugin/sw_runtime_kernels/kernels/src/gated_delta_net.cpp)
+- DPU MatMul run/wait：`sw_runtime_kernels/kernels/inc/dpu_shave_matmul.hpp`
+- DPU driver start/wait：`sw_runtime_kernels/kernels/inc/dpu_drv.hpp`
+- GDN kernel：`sw_runtime_kernels/kernels/src/gated_delta_net.cpp`
 
 ## 4. GDN 算法依赖
 
@@ -333,8 +333,8 @@ GDN 已为不同 MatMul shape 分配多份 params，这有利于清晰管理生�
 
 Attention kernel 已使用分离的 `run/wait`，并在 DPU 运行期间执行 softmax、归一化或 DMA 配置：
 
-- [Attention pipeline](../../../applications.ai.vpu-accelerators.vpux-plugin/sw_runtime_kernels/kernels/src/attention.cpp)
-- [Flash Attention DMA pipeline](../../../applications.ai.vpu-accelerators.vpux-plugin/sw_runtime_kernels/kernels/src/attention_dma_flash.cpp)
+- Attention pipeline：`sw_runtime_kernels/kernels/src/attention.cpp`
+- Flash Attention DMA pipeline：`sw_runtime_kernels/kernels/src/attention_dma_flash.cpp`
 
 这证明 NPU 软件栈支持延迟等待，也提供了代码组织参考。但它不能替代 GDN 多 SHAVE/head 场景的硬件验证。
 
@@ -371,7 +371,7 @@ k_shared = T.alloc_shared((2, block_S, DK), ...)
 - `data_is_ready`：输入已经加载完成，可以计算；
 - `data_is_free`：所有消费者已完成，可以覆盖该 stage。
 
-参考 [FlashQLA Hopper fused forward](../../../temp/FlashQLA/flash_qla/ops/gated_delta_rule/chunk/hopper/fused_fwd.py)。
+参考 FlashQLA 中的 `flash_qla/ops/gated_delta_rule/chunk/hopper/fused_fwd.py`。
 
 NPU 上对应为 DMA event/descriptor 和显式 buffer ownership，而不是 CUDA warpgroup barrier。
 
@@ -392,7 +392,7 @@ NPU 上对应为 DMA event/descriptor 和显式 buffer ownership，而不是 CUD
 ### 9.1 三角求解内部
 
 $$
-U_t=R_t-\beta_t\sum_{i<t}L_{t,i}U_i
+U_t=R_t-\beta_t\sum_{i=0}^{t-1}L_{t,i}U_i
 $$
 
 $U_t$ 依赖所有更早的 $U_i$。当前实现中每个 32-row block 内必须按行 forward substitution。
@@ -509,7 +509,7 @@ Phase 4 若新增 ping-pong buffer，需要同步修改：
 - CMX fit 和 sequence split 行为；
 - lit test 中可能受影响的 tiling/split 预期。
 
-当前 scratch 计算见 [VPU GDN op](../../../applications.ai.vpu-accelerators.vpux-plugin/src/vpux_compiler/src/dialect/VPU/IR/ops/gated_delta_net.cpp)。
+当前 scratch 计算见 `src/vpux_compiler/src/dialect/VPU/IR/ops/gated_delta_net.cpp`。
 
 ## 12. 验证方案
 
@@ -528,7 +528,7 @@ Phase 4 若新增 ping-pong buffer，需要同步修改：
 - sequence split 后的多个 GDN op；
 - NPU50XX 和可用的 NPU60XX。
 
-现有入口：[GDN single-layer tests](../../../applications.ai.vpu-accelerators.vpux-plugin/tests/functional/single_layer_tests/gated_delta_net.cpp)。
+现有测试入口为 `tests/functional/single_layer_tests/gated_delta_net.cpp`。
 
 建议额外增加同步/异步 A/B debug 开关，在完全相同输入上直接比较：
 

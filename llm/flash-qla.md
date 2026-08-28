@@ -211,17 +211,19 @@ $$
 两个 token 的方程可以写为：
 
 $$
-\begin{bmatrix}
-1&0\\
-\beta_1(k_1k_0^\top)&1
-\end{bmatrix}
-\begin{bmatrix}
-u_0\\u_1
-\end{bmatrix}
+\left[\begin{array}{cc}
+1 & 0 \cr
+\beta_1\left(k_1 k_0^{\top}\right) & 1
+\end{array}\right]
+\left[\begin{array}{c}
+u_0 \cr
+u_1
+\end{array}\right]
 =
-\begin{bmatrix}
-R_0\\R_1
-\end{bmatrix}
+\left[\begin{array}{c}
+R_0 \cr
+R_1
+\end{array}\right]
 $$
 
 #### 三个 Token 的结构
@@ -239,18 +241,22 @@ $$
 也就是：
 
 $$
-\begin{bmatrix}
-1&0&0\\
-c_{10}&1&0\\
-c_{20}&c_{21}&1
-\end{bmatrix}
-\begin{bmatrix}
-u_0\\u_1\\u_2
-\end{bmatrix}
+\left[\begin{array}{ccc}
+1 & 0 & 0 \cr
+c_{10} & 1 & 0 \cr
+c_{20} & c_{21} & 1
+\end{array}\right]
+\left[\begin{array}{c}
+u_0 \cr
+u_1 \cr
+u_2
+\end{array}\right]
 =
-\begin{bmatrix}
-R_0\\R_1\\R_2
-\end{bmatrix}
+\left[\begin{array}{c}
+R_0 \cr
+R_1 \cr
+R_2
+\end{array}\right]
 $$
 
 矩阵一定是下三角的，因为 token $t$ 只依赖更早的 token $i<t$，不会依赖未来 token。
@@ -273,9 +279,7 @@ $$
 因此一般形式为：
 
 $$
-u_t+
-\sum_{i<t}\beta_t d_{ti}\left(k_tk_i^\top\right)u_i
-=R_t
+u_t+\sum_{i=0}^{t-1}\beta_t d_{ti}\left(k_t k_i^{\top}\right)u_i=R_t
 $$
 
 其中：
