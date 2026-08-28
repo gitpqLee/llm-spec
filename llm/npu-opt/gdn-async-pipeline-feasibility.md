@@ -340,24 +340,194 @@ Attention kernel 已使用分离的 `run/wait`，并在 DPU 运行期间执行 s
 
 ## 8. 第二阶段：DMA、DPU、SHAVE 三方流水
 
-### 8.1 目标
+### 8.1 三方流水与 ping-pong 的关系
+
+DMA、DPU、SHAVE 三方流水通常依赖 ping-pong 双 buffer，但二者不是同一个概念：
+
+- **ping-pong 双 buffer** 是内存组织方式，解决“生产者写下一份数据时不能覆盖消费者仍在使用的数据”；
+- **三方流水** 是执行调度方式，让 DMA、DPU、SHAVE 在同一时间分别推进不同阶段的工作。
+
+只有双 buffer 而没有异步调度，仍然可能按顺序执行，得不到性能收益；只有异步调度而复用同一 buffer，则会产生读写冲突。两者必须配合。
+
+假设序列长度 $S=256$，内部 chunk 长度 $C=64$：
+
+```text
+chunk 0: token   0~63
+chunk 1: token  64~127
+chunk 2: token 128~191
+chunk 3: token 192~255
+```
+
+单 buffer 下，必须完成当前 chunk 后才能覆盖该 buffer：
+
+```text
+load chunk 0 → compute chunk 0 → load chunk 1 → compute chunk 1
+```
+
+使用 A/B 两个输入 stage 后，可以交错执行：
+
+| 时间 | Buffer A | Buffer B |
+|---|---|---|
+| $T_0$ | DMA 加载 chunk 0 | 空闲 |
+| $T_1$ | DPU/SHAVE 计算 chunk 0 | DMA 加载 chunk 1 |
+| $T_2$ | DMA 加载 chunk 2 | DPU/SHAVE 计算 chunk 1 |
+| $T_3$ | DPU/SHAVE 计算 chunk 2 | DMA 加载 chunk 3 |
+
+之所以需要两个 stage，是因为 DPU/SHAVE 消费 Buffer A 中 chunk 0 时，DMA 不能同时把 chunk 1 写入 Buffer A，否则会覆盖尚未读取完的数据。
+
+### 8.2 目标执行形态
 
 在处理 chunk $i$ 时预取 chunk $i+1$：
 
 ```text
-DMA:                load chunk 1   load chunk 2
-DPU:      matmul chunk 0  matmul chunk 1
-SHAVE:    scalar chunk 0  scalar chunk 1
+时间:      填充阶段             稳态 0                  稳态 1              排空阶段
+DMA:      load chunk 0     load chunk 1(B)         load chunk 2(A)              -
+DPU:           -           matmul chunk 0(A)       matmul chunk 1(B)      matmul chunk 2(A)
+SHAVE:         -           scalar chunk 0(A)       scalar chunk 1(B)      scalar chunk 2(A)
 ```
 
-需要两套输入 stage：
+这包含两层重叠：
+
+1. **跨 chunk 重叠**：DMA 加载 chunk $i+1$，同时 DPU/SHAVE 处理 chunk $i$；
+2. **chunk 内重叠**：DPU 执行某次 MatMul，同时 SHAVE 执行与该结果无依赖的逐元素计算。
+
+流水不能消除第一个 chunk 的加载时间和最后一个 chunk 的排空时间。若有 $N$ 个 chunk，理想总时间近似为：
+
+$$
+T_{total}\approx T_{fill}+(N-1)\max(T_{load},T_{compute})+T_{drain}
+$$
+
+而顺序执行近似为：
+
+$$
+T_{serial}\approx N(T_{load}+T_{compute})
+$$
+
+因此只有在多个 chunk 且 DMA 时间与计算时间具有可重叠部分时，跨 chunk 流水才有意义。$S\le64$ 时没有下一个 chunk 可预取，收益基本为零。
+
+### 8.3 GDN 中哪些工作可以跨 chunk 提前
+
+相邻 chunk 之间存在状态递推：
+
+$$
+H_0^{(i+1)}=H_C^{(i)}
+$$
+
+所以不能把 chunk $i$ 和 $i+1$ 当成完全独立任务。下一 chunk 的工作要分为两类。
+
+#### 与 state 无关，可以提前
+
+- DMA 加载下一 chunk 的 Q/K/V/gate/beta；
+- Q/K L2Norm；
+- gate、$\beta$ 和 chunk 内累计 decay；
+- $KK^T$；
+- $QK^T$。
+
+这些结果只依赖下一 chunk 自身的输入，不依赖上一 chunk 的最终 state。
+
+#### 与 state 有关，必须等待
+
+- $KH_0$ 和 $QH_0$；
+- $R=\beta(V-\gamma KH_0)$；
+- 三角求解 $LU=R$；
+- chunk 输出；
+- state update。
+
+因此可实现的流水不是“两个完整 chunk 并行”，而是：
 
 ```text
-stage A：当前 chunk 正在消费
-stage B：下一 chunk 正在加载/准备
+chunk i:
+        state-dependent compute ───────────────→ produce H(i+1)
+
+chunk i+1:
+        DMA → norm/gate → state-independent work ─┬→ wait H(i+1)
+                                                                                             └→ state-dependent compute
 ```
 
-### 8.2 与 FlashQLA 的对应关系
+首版跨 chunk 原型应只做输入 DMA；进一步提前 norm/gate 或 Gram MatMul 会要求更多 staging buffer 和更复杂的 DPU 调度，应逐项评估。
+
+### 8.4 最小双缓冲集合
+
+不应把当前每个 SHAVE 的全部 scratch 简单复制两份。应只双缓冲下一 chunk 可以提前准备、且会被当前 chunk 占用的对象。
+
+建议的初始设计：
+
+```text
+Stage A/B，各自包含：
+    raw Q tile
+    raw K tile
+    raw V tile
+    gate tile
+    beta tile
+
+单份共享工作区：
+    H0T                     recurrent state
+    U / R                   当前 chunk 三角求解
+    s0k / s0q               state-dependent 中间量
+    stateOutH16             state update 输出
+    DPU descriptor / stats
+```
+
+如果 profile 证明 DMA-only overlap 有收益，再考虑把下列结果加入 A/B stage：
+
+```text
+Kn / Qn
+KnH16 / QnH16
+KKt / QKt
+```
+
+代价是 per-SHAVE scratch 增大。尤其 `KKt/QKt` 是 $C\times C$，不能在没有收益数据时直接双份分配。
+
+state 必须保持逻辑单份，因为 chunk 间有严格递推。可以为了布局转换保留临时副本，但不能让 A/B stage 各自沿独立 state 链计算。
+
+### 8.5 Buffer 生命周期与同步
+
+每个 stage 至少需要两个逻辑事件：
+
+- `ready`：DMA 已完成写入，DPU/SHAVE 可以读取；
+- `free`：当前消费者已完成读取，DMA 可以覆盖。
+
+状态机为：
+
+```text
+FREE --DMA start--> LOADING --DMA done--> READY
+    ^                                      |
+    |                                      v
+    +------------- consumer done <----- IN_USE
+```
+
+伪代码：
+
+```cpp
+startPrefetch(/*chunk=*/0, stage[0]);
+
+for (size_t chunk = 0; chunk < numChunks; ++chunk) {
+        Stage& current = stage[chunk % 2];
+        Stage& next = stage[(chunk + 1) % 2];
+
+        waitDmaReady(current);
+
+        if (chunk + 1 < numChunks) {
+                waitStageFree(next);
+                startPrefetch(chunk + 1, next);
+        }
+
+        processChunk(current, recurrentState);
+        markStageFree(current);
+}
+```
+
+同步规则如下：
+
+1. DMA 启动前，目标 stage 必须为 `FREE`；
+2. DMA 完成前，SHAVE/DPU 不得读取目标 stage；
+3. DPU 读取某个 stage 时，DMA 不得覆盖它；
+4. 所有消费者结束后才能将 stage 标记为 `FREE`；
+5. `H_0^{(i+1)}` 未生成前，chunk $i+1$ 不得进入 state-dependent 阶段。
+
+NPU 上应使用现有 DMA descriptor 的 `start/wait` 和明确的 buffer ownership 实现这些约束，不能依赖预计执行时间。
+
+### 8.6 与 FlashQLA 的对应关系
 
 FlashQLA 使用双缓冲 shared memory：
 
@@ -375,15 +545,102 @@ k_shared = T.alloc_shared((2, block_S, DK), ...)
 
 NPU 上对应为 DMA event/descriptor 和显式 buffer ownership，而不是 CUDA warpgroup barrier。
 
-### 8.3 主要障碍
+两者思想上的映射为：
 
-1. 当前 GDN scratch 已按每个 SHAVE 复制，新增完整双缓冲可能显著增加 CMX；
-2. `Kn/Qn/KKt/QKt` 等中间量并非都需要双份，应只复制跨 chunk 预取所需的最小集合；
-3. 下一个 chunk 的 `KH_0` 和 `QH_0` 依赖当前 chunk 的最终状态，不能提前执行；
-4. 可以提前做的工作主要是输入 DMA、Q/K normalization、gate 和与状态无关的 Gram MatMul；
-5. SHAVE 在准备下一 chunk 时不能覆盖当前 DPU 仍在读取的 staging buffer。
+| FlashQLA | NPU GDN 目标设计 |
+|---|---|
+| global memory | DDR |
+| shared-memory stage 0/1 | CMX input stage A/B |
+| TMA producer | DMA engine/descriptor |
+| Tensor Core | DPU |
+| consumer warpgroup | SHAVE + DPU 控制流 |
+| `data_is_ready` | DMA completion / stage ready |
+| `data_is_free` | consumer completion / stage free |
 
-因此第二阶段应先尝试“输入 DMA 双缓冲”，不要直接复制全部 FP32/FP16 scratch。
+不能直接照搬 FlashQLA 的 warpgroup barrier。NPU 需要沿用本平台已有的 DMA 与 DPU completion 机制。
+
+### 8.7 Compiler 与 runtime 的实现边界
+
+当前 GDN 最终 lowering 为一个 `VPUIP.SwKernel`。kernel 内部的 64-token chunk 对 compiler 不可见：
+
+```text
+Compiler 看到：一个 GatedDeltaNet op
+Kernel 看到：  chunk 0、chunk 1、chunk 2...
+```
+
+当前 compiler 负责：
+
+- 安排 GDN operands/results 和 scratch；
+- 根据 CMX 容量做 head tiling；
+- 必要时沿 sequence 生成串行 GDN op；
+- 将 GDN lowering 到 SW kernel。
+
+当前 GDN kernel 没有两套 chunk input stage、DMA descriptor 或 ready/free 协议，因此没有跨 chunk ping-pong。
+
+存在两种实现路线。
+
+#### 路线 A：runtime kernel 主导
+
+让 GDN kernel 获得 DDR 输入地址、CMX A/B stage 和 DMA descriptor，在 kernel 内控制预取、等待和 stage 交换。
+
+优点：
+
+- chunk 边界已经存在于 kernel 内，调度直接；
+- 可复用 `attention_dma_flash.cpp` 的 DMA 编程模式；
+- 更容易实现细粒度 DMA/DPU/SHAVE 重叠。
+
+缺点：
+
+- 可能需要修改 kernel 参数和 lowering；
+- compiler 必须避免先把完整 sequence 复制到普通 CMX operand；
+- scratch sizing、CMX fit 和 sequence split 逻辑都要重新评估。
+
+#### 路线 B：compiler 展开流水
+
+把输入 DMA 和 chunk compute 表达为显式任务：
+
+```text
+DMA chunk 0
+DMA chunk 1 || compute chunk 0
+DMA chunk 2 || compute chunk 1
+```
+
+优点是 DMA/barrier 和 CMX 生命周期对 compiler 可见。缺点是当前 GDN kernel 内融合了多次 MatMul、三角求解和 state update，需要拆分 kernel 或引入新的流式执行接口，改动范围明显更大。
+
+基于现有实现，路线 A 更接近已有 Attention 先例，适合作为原型；路线 B 只有在需要统一 compiler 调度和跨 op 优化时再考虑。
+
+### 8.8 CMX 收益与代价
+
+双缓冲会增加局部 stage 的内存，但流式输入可能减少整个 sequence 的 CMX 驻留。因此不能简单得出“双缓冲一定增加总 CMX”的结论。
+
+若完整输入都驻留 CMX，其规模随 $S$ 增长：
+
+$$
+M_{full}=O\left(S(H_qD+H_vD_v+H_v)\right)
+$$
+
+若输入从 DDR 按 chunk 流入，只保留两个长度为 $C$ 的 stage：
+
+$$
+M_{stream}=O\left(2C(H_qD+H_vD_v+H_v)\right),\quad C=64
+$$
+
+当 $S\gg2C$ 时，流式方案可能减少总 CMX，并减少 compiler 因 CMX 不足产生的 sequence split。反之，如果 compiler 仍保留完整 sequence 的 CMX operand，再额外分配 A/B stage，CMX 只会增加且没有解决根因。
+
+因此 Phase 4 的必要条件是确认并改变输入驻留路径，而不是只扩大现有 scratch。
+
+### 8.9 主要障碍
+
+1. 需要确认 GDN kernel 能否直接访问 DDR 输入，或需要新增参数/lowering；
+2. 当前 scratch 按每个 SHAVE 复制，A/B stage 的大小会被 active SHAVE 数放大；
+3. `Kn/Qn/KKt/QKt` 不应默认全部双份；
+4. 下一个 chunk 的 $KH_0$、$QH_0$ 仍受 state 依赖限制；
+5. DMA、DPU 和 SHAVE 必须遵守同一套 buffer ownership；
+6. 多 SHAVE 可能同时提交 DMA 和 DPU，需要验证 engine contention；
+7. 尾 chunk、非 16 对齐和动态 shape 会增加 DMA descriptor 配置复杂度；
+8. 如果 DMA 不是当前瓶颈，新增同步和 staging 可能没有收益。
+
+因此第二阶段应先尝试“原始输入 DMA 双缓冲”，并保留其余计算工作区单份。只有 profile 证明输入加载已被有效隐藏且仍有可利用空隙时，才扩大到 norm/gate 或 Gram MatMul 的跨 chunk 预计算。
 
 ## 9. 不可并行的关键路径
 
