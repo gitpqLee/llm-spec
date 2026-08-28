@@ -1,8 +1,29 @@
-# NPU GatedDeltaNet 异步并行可行性分析
+# NPU GatedDeltaNet 两级流水优化可行性分析
 
-## 1. 文档目标
+## 1. 报告范围与方案总览
 
-本文分析在 NPU `GatedDeltaNet`（GDN）kernel 中实现异步并行的可行性，重点回答：
+本文分析 NPU `GatedDeltaNet`（GDN）prefill 的两个独立但可组合的流水优化方案：
+
+1. **方案一：chunk 内 DPU/SHAVE 异步重叠**。把同步的 `dpuMatMulRunW()` 拆成 `run → SHAVE 独立工作 → wait`，隐藏部分 DPU 等待时间；
+2. **方案二：跨 chunk DMA ping-pong 流水**。使用 A/B 两套输入 stage，在计算 chunk $i$ 时预取 chunk $i+1$，隐藏 DDR 到 CMX 的搬运时间。
+
+两者解决不同问题：
+
+| 方案 | 优化范围 | 隐藏的延迟 | 是否需要双 buffer | 首版是否修改 compiler |
+|---|---|---|---:|---:|
+| 方案一 | 单个 chunk 内 | DPU MatMul latency | 否 | 否 |
+| 方案二 | 相邻 chunk 间 | DMA/DDR latency | 是 | 很可能需要 |
+
+建议阅读顺序：
+
+```text
+第 3 章：共同基础
+    ├── 第 4 章：方案一，低风险、先实施
+    ├── 第 5 章：方案二，高风险、后评估
+    └── 第 6~7 章：共同边界、实施和验证
+```
+
+本文重点回答：
 
 1. 当前实现为什么没有充分重叠 DPU 与 SHAVE；
 2. 哪些计算可以并行，哪些必须串行；
@@ -12,9 +33,9 @@
 
 本文重点讨论 prefill（$S>1$）。`S=1` 已分派到专用 `gated_delta_net_s1` kernel，chunk 内三角求解和流水对 decode token rate 基本没有直接帮助。
 
-## 2. 结论摘要
+## 2. 总体结论与优先级
 
-### 2.1 总体结论
+### 2.1 推荐结论
 
 在现有软件接口上实现 **单个 DPU workload 与 SHAVE 计算重叠** 是可行的，风险可控，建议实施。
 
@@ -32,7 +53,7 @@
 2. state-update DPU MatMul 与 SHAVE output 写回重叠；
 3. `KK^T` DPU MatMul 与 Q/state FP16 staging 重叠。
 
-跨 chunk 的 DMA ping-pong 也具有可行性，但需要新增 buffer、DMA descriptor 和生命周期协议，CMX 压力更高，应作为第二阶段独立评估。
+跨 chunk 的 DMA ping-pong 也具有可行性，但需要新增 buffer、DMA descriptor 和生命周期协议，CMX 压力更高，应作为方案二独立评估。
 
 ### 2.2 可行性等级
 
@@ -40,13 +61,13 @@
 |---|---:|---:|---:|---|
 | 单 DPU workload 与 SHAVE 重叠 | 高 | 低到中 | 中 | 首先实施 |
 | chunk 内多个 DPU workload 同时在途 | 中 | 中到高 | 未知 | 暂不作为首版目标 |
-| DMA、DPU、SHAVE 三方重叠 | 中 | 高 | 中到高 | 第二阶段原型 |
+| DMA、DPU、SHAVE 三方重叠 | 中 | 高 | 中到高 | 方案二原型 |
 | 相邻 chunk 完整双缓冲 | 中 | 高 | 取决于 DDR 占比 | profile 后决定 |
 | FlashQLA 式多 consumer 角色重构 | 低到中 | 很高 | 未知 | 不建议直接照搬 |
 
-## 3. 当前实现
+## 3. 共同基础：当前实现与算法依赖
 
-### 3.1 执行资源
+### 3.1 执行资源与并行维度
 
 GDN kernel 同时使用三类资源：
 
@@ -64,7 +85,7 @@ for (size_t h_v = shaveId; h_v < v_H; h_v += numShaves) {
 
 因此，不同 head 已经可以并行。但对同一 SHAVE 的同一 head/chunk，算法阶段按 C++ 语句顺序执行。
 
-### 3.2 当前同步模式
+### 3.2 当前 DPU 同步模式
 
 GDN 的所有 DPU MatMul 当前使用同步封装：
 
@@ -93,7 +114,7 @@ SHAVE 执行后处理
 
 这保证了正确性，但 DPU 工作期间没有利用当前 SHAVE 执行独立计算。
 
-### 3.3 `run` 和 `wait` 的底层语义
+### 3.3 DPU `run` 和 `wait` 的底层语义
 
 `dpuMatMulRun()` 配置输入、权重和输出 CMX 地址，提交 descriptor：
 
@@ -120,7 +141,7 @@ while (*workDuration == 0) {
 - DPU driver start/wait：`sw_runtime_kernels/kernels/inc/dpu_drv.hpp`
 - GDN kernel：`sw_runtime_kernels/kernels/src/gated_delta_net.cpp`
 
-## 4. GDN 算法依赖
+### 3.4 GDN 算法依赖图
 
 对一个长度为 $C\le64$ 的 chunk，定义：
 
@@ -164,9 +185,9 @@ flowchart LR
 
 图中的箭头是必须满足的真实数据依赖。没有直接依赖且 buffer 不冲突的节点可以重叠。
 
-## 5. 首选异步方案
+## 4. 方案一：chunk 内 DPU/SHAVE 异步重叠
 
-### 5.1 方案 A：`QK^T` 与 `R` 重叠
+### 4.1 异步窗口 A：`QK^T` 与 `R` 重叠
 
 数学上：
 
@@ -205,7 +226,7 @@ foldDecayIntoQKt();
 
 这是第一优先级实验，因为代码改动小、依赖清晰，且 `computeR` 有 $C\times D_v$ 个 FP32 元素操作，可形成实际重叠窗口。
 
-### 5.2 方案 B：state-update 与 output 写回重叠
+### 4.2 异步窗口 B：state-update 与 output 写回重叠
 
 当 `intraH16` 和 `U` 已准备完成后：
 
@@ -236,7 +257,7 @@ updateH0T(H0T, stateOutH16, gammaLast);
 
 该方案的重叠窗口是 $C\times D_v$ 的 output scale-add 和类型化 store。
 
-### 5.3 方案 C：`KK^T` 与 FP16 staging 重叠
+### 4.3 异步窗口 C：`KK^T` 与 FP16 staging 重叠
 
 启动 $KK^T$ 后，可准备不冲突的 `QnH16` 和 `H0TH16`：
 
@@ -253,9 +274,9 @@ foldDecayIntoKKt();
 
 这个方案正确性的前提是 `H0TH16` 在 DPU 计算 $KK^T$ 时没有被其他任务使用。当前顺序下满足该条件，但实现时仍应通过 buffer-lifetime 表逐项审查。
 
-## 6. 同步协议
+### 4.4 DPU/SHAVE 同步协议
 
-### 6.1 基本规则
+#### 4.4.1 基本规则
 
 异步化后使用以下规则决定 `wait` 的位置：
 
@@ -277,7 +298,7 @@ wait(params)
 inputs/output/params reusable
 ```
 
-### 6.2 Buffer 状态
+#### 4.4.2 Buffer 状态
 
 建议在代码评审和调试版本中按以下状态理解每个 buffer：
 
@@ -290,7 +311,7 @@ inputs/output/params reusable
 
 首版不必实现通用状态机；保持结构化的 `run → independent work → wait → consume` 即可。但应为每个异步区间维护书面的 buffer-lifetime 表。
 
-### 6.3 异常和提前返回
+#### 4.4.3 异常和提前返回
 
 一旦 `run` 成功提交，任何控制流在离开当前 scope 前都必须执行对应 `wait`。首版异步区间中不应包含：
 
@@ -300,7 +321,7 @@ inputs/output/params reusable
 
 当前 kernel 不使用 C++ 异常，因此主要风险是后续维护引入提前退出。
 
-### 6.4 Descriptor 复用
+#### 4.4.4 Descriptor 复用
 
 `DpuParamsBuffers` 内含 descriptor 和 completion 字段。对应 workload 完成前：
 
@@ -310,15 +331,15 @@ inputs/output/params reusable
 
 GDN 已为不同 MatMul shape 分配多份 params，这有利于清晰管理生命周期。
 
-## 7. 多 SHAVE 与 DPU 争用
+### 4.5 多 SHAVE 与 DPU 争用
 
-### 7.1 现状
+#### 4.5.1 现状
 
 每个 SHAVE 独立处理 value head，并拥有独立 scratch、DPU params 和 staging buffer。因此内存上不存在跨 SHAVE descriptor 复用。
 
 但是多个 SHAVE 可能同时向同一 tile 的 DPU FIFO 提交 workload。当前同步版本也存在这种可能，只是每个 SHAVE 提交后立即等待。
 
-### 7.2 首版边界
+#### 4.5.2 首版边界
 
 建议首版遵守：
 
@@ -329,7 +350,7 @@ GDN 已为不同 MatMul shape 分配多份 params，这有利于清晰管理生�
 
 这样不会增加单个 SHAVE 的 DPU queue depth，只会推迟 wait。
 
-### 7.3 已有平台先例
+#### 4.5.3 已有平台先例
 
 Attention kernel 已使用分离的 `run/wait`，并在 DPU 运行期间执行 softmax、归一化或 DMA 配置：
 
@@ -338,9 +359,9 @@ Attention kernel 已使用分离的 `run/wait`，并在 DPU 运行期间执行 s
 
 这证明 NPU 软件栈支持延迟等待，也提供了代码组织参考。但它不能替代 GDN 多 SHAVE/head 场景的硬件验证。
 
-## 8. 第二阶段：DMA、DPU、SHAVE 三方流水
+## 5. 方案二：跨 chunk DMA ping-pong 流水
 
-### 8.1 三方流水与 ping-pong 的关系
+### 5.1 三方流水与 ping-pong 的关系
 
 DMA、DPU、SHAVE 三方流水通常依赖 ping-pong 双 buffer，但二者不是同一个概念：
 
@@ -375,7 +396,7 @@ load chunk 0 → compute chunk 0 → load chunk 1 → compute chunk 1
 
 之所以需要两个 stage，是因为 DPU/SHAVE 消费 Buffer A 中 chunk 0 时，DMA 不能同时把 chunk 1 写入 Buffer A，否则会覆盖尚未读取完的数据。
 
-### 8.2 目标执行形态
+### 5.2 目标执行形态
 
 在处理 chunk $i$ 时预取 chunk $i+1$：
 
@@ -405,7 +426,7 @@ $$
 
 因此只有在多个 chunk 且 DMA 时间与计算时间具有可重叠部分时，跨 chunk 流水才有意义。$S\le64$ 时没有下一个 chunk 可预取，收益基本为零。
 
-### 8.3 GDN 中哪些工作可以跨 chunk 提前
+### 5.3 GDN 中哪些工作可以跨 chunk 提前
 
 相邻 chunk 之间存在状态递推：
 
@@ -446,7 +467,7 @@ chunk i+1:
 
 首版跨 chunk 原型应只做输入 DMA；进一步提前 norm/gate 或 Gram MatMul 会要求更多 staging buffer 和更复杂的 DPU 调度，应逐项评估。
 
-### 8.4 最小双缓冲集合
+### 5.4 最小双缓冲集合
 
 不应把当前每个 SHAVE 的全部 scratch 简单复制两份。应只双缓冲下一 chunk 可以提前准备、且会被当前 chunk 占用的对象。
 
@@ -480,7 +501,7 @@ KKt / QKt
 
 state 必须保持逻辑单份，因为 chunk 间有严格递推。可以为了布局转换保留临时副本，但不能让 A/B stage 各自沿独立 state 链计算。
 
-### 8.5 Buffer 生命周期与同步
+### 5.5 Buffer 生命周期与同步
 
 每个 stage 至少需要两个逻辑事件：
 
@@ -527,7 +548,7 @@ for (size_t chunk = 0; chunk < numChunks; ++chunk) {
 
 NPU 上应使用现有 DMA descriptor 的 `start/wait` 和明确的 buffer ownership 实现这些约束，不能依赖预计执行时间。
 
-### 8.6 与 FlashQLA 的对应关系
+### 5.6 与 FlashQLA 的对应关系
 
 FlashQLA 使用双缓冲 shared memory：
 
@@ -559,7 +580,7 @@ NPU 上对应为 DMA event/descriptor 和显式 buffer ownership，而不是 CUD
 
 不能直接照搬 FlashQLA 的 warpgroup barrier。NPU 需要沿用本平台已有的 DMA 与 DPU completion 机制。
 
-### 8.7 Compiler 与 runtime 的实现边界
+### 5.7 Compiler 与 runtime 的实现边界
 
 当前 GDN 最终 lowering 为一个 `VPUIP.SwKernel`。kernel 内部的 64-token chunk 对 compiler 不可见：
 
@@ -609,7 +630,7 @@ DMA chunk 2 || compute chunk 1
 
 基于现有实现，路线 A 更接近已有 Attention 先例，适合作为原型；路线 B 只有在需要统一 compiler 调度和跨 op 优化时再考虑。
 
-### 8.8 CMX 收益与代价
+### 5.8 CMX 收益与代价
 
 双缓冲会增加局部 stage 的内存，但流式输入可能减少整个 sequence 的 CMX 驻留。因此不能简单得出“双缓冲一定增加总 CMX”的结论。
 
@@ -629,7 +650,7 @@ $$
 
 因此 Phase 4 的必要条件是确认并改变输入驻留路径，而不是只扩大现有 scratch。
 
-### 8.9 主要障碍
+### 5.9 主要障碍
 
 1. 需要确认 GDN kernel 能否直接访问 DDR 输入，或需要新增参数/lowering；
 2. 当前 scratch 按每个 SHAVE 复制，A/B stage 的大小会被 active SHAVE 数放大；
@@ -640,13 +661,13 @@ $$
 7. 尾 chunk、非 16 对齐和动态 shape 会增加 DMA descriptor 配置复杂度；
 8. 如果 DMA 不是当前瓶颈，新增同步和 staging 可能没有收益。
 
-因此第二阶段应先尝试“原始输入 DMA 双缓冲”，并保留其余计算工作区单份。只有 profile 证明输入加载已被有效隐藏且仍有可利用空隙时，才扩大到 norm/gate 或 Gram MatMul 的跨 chunk 预计算。
+因此方案二应先尝试“原始输入 DMA 双缓冲”，并保留其余计算工作区单份。只有 profile 证明输入加载已被有效隐藏且仍有可利用空隙时，才扩大到 norm/gate 或 Gram MatMul 的跨 chunk 预计算。
 
-## 9. 不可并行的关键路径
+## 6. 两个方案的共同边界
 
 下列依赖不能通过简单移动 `wait` 消除：
 
-### 9.1 三角求解内部
+### 6.1 三角求解内部
 
 $$
 U_t=R_t-\beta_t\sum_{i=0}^{t-1}L_{t,i}U_i
@@ -654,7 +675,7 @@ $$
 
 $U_t$ 依赖所有更早的 $U_i$。当前实现中每个 32-row block 内必须按行 forward substitution。
 
-### 9.2 相邻 chunk 的状态传递
+### 6.2 相邻 chunk 的状态传递
 
 $$
 H_0^{(c+1)}=H_C^{(c)}
@@ -662,13 +683,13 @@ $$
 
 下一个 chunk 的 state-dependent MatMul 必须等待当前 chunk 状态更新完成。
 
-### 9.3 DPU 输出消费
+### 6.3 DPU 输出消费
 
 例如 decay folding 读取 `QKtH16`，必须位于对应 `dpuMatMulWait()` 之后。C++ 代码顺序和 `volatile` completion 轮询共同形成同步，不能依赖“通常 DPU 已经算完”的时间假设。
 
-## 10. 实施计划
+## 7. 统一落地计划
 
-### Phase 0：建立基线
+### 7.1 Phase 0：建立基线
 
 目标：确认瓶颈和可隐藏时间，不修改算法。
 
@@ -691,7 +712,7 @@ $$
 | 多 chunk | 128, 256, 512 | 16/16 | 128/128 |
 | GQA | 512 | 6/12, 16/32 | 128/128 |
 
-### Phase 1：一个异步窗口
+### 7.2 Phase 1：方案一最小异步窗口
 
 只实现：
 
@@ -707,7 +728,7 @@ DPU QK^T || SHAVE compute R
 - 多 SHAVE、多 cluster 无 hang；
 - 对短序列没有显著回退。
 
-### Phase 2：增加两个安全窗口
+### 7.3 Phase 2：扩展方案一
 
 加入：
 
@@ -718,7 +739,7 @@ DPU state update || SHAVE write output
 
 每增加一个窗口，都单独测量增量收益，避免多个改动混在一起无法定位问题。
 
-### Phase 3：调度和 shape 选择
+### 7.4 Phase 3：方案一的 shape 选择
 
 异步开销对小 shape 可能得不偿失，可根据 profile 增加静态分支：
 
@@ -730,15 +751,15 @@ S=1：专用 decode kernel
 
 在建立 cycle-cost 数据前，不建议凭经验固定阈值。
 
-### Phase 4：DMA ping-pong 原型
+### 7.5 Phase 4：方案二 DMA ping-pong 原型
 
 仅在 Phase 1/2 已证明 DPU/SHAVE overlap 有收益，并且 profile 显示 DDR/DMA 占比仍高时进入。
 
 首个原型只双缓冲原始 Q/K/V/gate/beta 输入，状态和大部分工作区保持单份。
 
-## 11. 预计代码改动
+### 7.6 预计代码改动
 
-### 11.1 Runtime kernel
+#### 7.6.1 Runtime kernel
 
 主要文件：
 
@@ -755,7 +776,7 @@ prepare → run → independent work → wait → consume
 
 但应避免与异步化无关的大规模重构。
 
-### 11.2 Compiler scratch
+#### 7.6.2 Compiler scratch
 
 Phase 1/2 复用现有 buffer，不增加 scratch，compiler 侧理论上无需改变。
 
@@ -768,9 +789,9 @@ Phase 4 若新增 ping-pong buffer，需要同步修改：
 
 当前 scratch 计算见 `src/vpux_compiler/src/dialect/VPU/IR/ops/gated_delta_net.cpp`。
 
-## 12. 验证方案
+### 7.7 验证方案
 
-### 12.1 正确性
+#### 7.7.1 正确性
 
 至少覆盖：
 
@@ -794,7 +815,7 @@ output
 final recurrent state
 ```
 
-### 12.2 稳定性
+#### 7.7.2 稳定性
 
 重点检测异步错误的非确定性特征：
 
@@ -804,7 +825,7 @@ final recurrent state
 - 连续运行多个 GDN layer；
 - 输出偶发差异、hang、completion 不返回和 descriptor 污染。
 
-### 12.3 性能
+#### 7.7.3 性能
 
 报告以下指标，而不只看端到端时间：
 
@@ -819,7 +840,7 @@ final recurrent state
 
 理想情况：DPU duration 基本不变，SHAVE 工作量基本不变，但总 kernel latency 和 wait 累计周期下降。
 
-## 13. 风险与缓解
+### 7.8 风险与缓解
 
 | 风险 | 现象 | 缓解方式 |
 |---|---|---|
@@ -832,9 +853,9 @@ final recurrent state
 | 双缓冲增加 CMX | 更多 sequence split | Phase 4 单独评估 CMX 与 DDR 收益 |
 | busy-wait 仍占 SHAVE | overlap 不充分 | 尽量把足够长的真实工作放在 run/wait 之间 |
 
-## 14. Go/No-Go 标准
+### 7.9 Go/No-Go 标准
 
-### Phase 1 继续推进条件
+#### 7.9.1 方案一继续推进条件
 
 满足全部条件：
 
@@ -844,7 +865,7 @@ final recurrent state
 - multi-SHAVE 场景无系统性回退；
 - 不增加 scratch/CMX。
 
-### 停止或回退条件
+#### 7.9.2 停止或回退条件
 
 出现任一情况应停止扩展异步窗口：
 
@@ -854,7 +875,7 @@ final recurrent state
 - 小 shape 回退无法通过简单策略选择规避；
 - DMA 双缓冲导致 sequence split 增加，抵消局部 kernel 收益。
 
-## 15. 最终建议
+### 7.10 最终建议
 
 推荐先实现最小原型：
 
