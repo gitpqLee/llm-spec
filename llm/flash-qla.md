@@ -210,54 +210,54 @@ $$
 
 两个 token 的方程可以写为：
 
-$$
-\left[\begin{array}{cc}
-1 & 0 \cr
+```math
+\begin{bmatrix}
+1 & 0 \\
 \beta_1\left(k_1 k_0^{\top}\right) & 1
-\end{array}\right]
-\left[\begin{array}{c}
-u_0 \cr
+\end{bmatrix}
+\begin{bmatrix}
+u_0 \\
 u_1
-\end{array}\right]
+\end{bmatrix}
 =
-\left[\begin{array}{c}
-R_0 \cr
+\begin{bmatrix}
+R_0 \\
 R_1
-\end{array}\right]
-$$
+\end{bmatrix}
+```
 
 #### 三个 Token 的结构
 
 三个 token 展开后是：
 
-$$
+```math
 \begin{aligned}
-u_0&=R_0\\
-c_{10}u_0+u_1&=R_1\\
-c_{20}u_0+c_{21}u_1+u_2&=R_2
+u_0 &= R_0 \\
+c_{10}u_0+u_1 &= R_1 \\
+c_{20}u_0+c_{21}u_1+u_2 &= R_2
 \end{aligned}
-$$
+```
 
 也就是：
 
-$$
-\left[\begin{array}{ccc}
-1 & 0 & 0 \cr
-c_{10} & 1 & 0 \cr
+```math
+\begin{bmatrix}
+1 & 0 & 0 \\
+c_{10} & 1 & 0 \\
 c_{20} & c_{21} & 1
-\end{array}\right]
-\left[\begin{array}{c}
-u_0 \cr
-u_1 \cr
+\end{bmatrix}
+\begin{bmatrix}
+u_0 \\
+u_1 \\
 u_2
-\end{array}\right]
+\end{bmatrix}
 =
-\left[\begin{array}{c}
-R_0 \cr
-R_1 \cr
+\begin{bmatrix}
+R_0 \\
+R_1 \\
 R_2
-\end{array}\right]
-$$
+\end{bmatrix}
+```
 
 矩阵一定是下三角的，因为 token $t$ 只依赖更早的 token $i<t$，不会依赖未来 token。
 
