@@ -358,7 +358,132 @@ A @ R
 
 这是算法层真正增加并行度的地方，不只是隐藏执行时间。
 
-### 4.3 不是通用矩阵求逆
+### 4.3 `K K^T`、$L$、$A$ 和 $V_d$ 到底是什么关系
+
+这里很容易产生一个误解：既然计算流程中先出现 $KK^\top$，而后面又要求
+$A=L^{-1}$，那么“求 $A$”是否就是“求 $KK^\top$”？
+
+答案是否定的。准确的数据流是：
+
+```text
+K Kᵀ
+        ↓ 加入 causal mask、gate decay、beta 和单位对角线
+构造单位下三角矩阵 L
+        ↓ 对三角系统求解
+A = L⁻¹
+        ↓ 矩阵乘
+Vd = A R
+```
+
+$KK^\top$ 只是构造 $L$ 的原材料。它给出 key 之间的相似度：
+
+$$
+(KK^\top)_{ti}=k_tk_i^\top
+$$
+
+但 $L$ 还需要表达以下信息：
+
+- causal：token $t$ 只受 $i<t$ 的 token 影响；
+- gate decay：token $i$ 的写入传播到 $t$ 时还剩多少；
+- $\beta_t$：token $t$ 修正预测误差的强度；
+- 单位对角线：当前未知量 $u_t$ 自己的系数为 1。
+
+因此：
+
+$$
+L_{ti}=
+\begin{cases}
+1,&t=i\\
+\beta_t d_{ti}(KK^\top)_{ti},&i<t\\
+0,&i>t
+\end{cases}
+$$
+
+#### 三个 token 的具体例子
+
+首先计算完整的 Gram 矩阵：
+
+$$
+KK^\top=
+\begin{bmatrix}
+k_0k_0^\top & k_0k_1^\top & k_0k_2^\top\\
+k_1k_0^\top & k_1k_1^\top & k_1k_2^\top\\
+k_2k_0^\top & k_2k_1^\top & k_2k_2^\top
+\end{bmatrix}
+$$
+
+经过 causal、decay 和 $\beta$ 处理后得到：
+
+$$
+L=
+\begin{bmatrix}
+1&0&0\\
+\beta_1d_{10}(k_1k_0^\top)&1&0\\
+\beta_2d_{20}(k_2k_0^\top)&
+\beta_2d_{21}(k_2k_1^\top)&1
+\end{bmatrix}
+$$
+
+可见 $L$ 并不等于 $KK^\top$：它只保留严格下三角的历史依赖，给这些依赖乘上
+gate 和 $\beta$，并把对角线替换为 1。
+
+接下来要解：
+
+$$
+LV_d=R
+$$
+
+有两种数学等价的实现方式。
+
+第一种是直接 forward substitution：
+
+$$
+u_0=R_0
+$$
+
+$$
+u_1=R_1-L_{10}u_0
+$$
+
+$$
+u_2=R_2-L_{20}u_0-L_{21}u_1
+$$
+
+这种方法直接得到 $V_d$，不显式生成 $A$。当前 NPU kernel 主要采用这种方式，并把
+64 行拆成两个 32 行块：块内由 SHAVE 前代，块间规则矩阵乘交给 DPU。
+
+第二种是先求变换矩阵：
+
+$$
+LA=I
+$$
+
+因此：
+
+$$
+A=L^{-1}
+$$
+
+再计算：
+
+$$
+V_d=AR
+$$
+
+这里 $A$ 的含义是“消除 chunk 内 token 相互干扰的变换矩阵”，不是 key 相似度矩阵。
+FlashQLA 更偏向这种组织，因为一旦获得 $A$，$A@R$ 就可以作为规则 GEMM 交给
+Tensor Core 高吞吐执行。
+
+可以用一句话区分四个量：
+
+```text
+KKᵀ：哪些 token 的 key 相似
+L：这些相似关系如何形成因果写入依赖
+A=L⁻¹：如何消除这些依赖造成的重复修正
+Vd=A R：每个 token 最终真正写入状态的 corrected value
+```
+
+### 4.4 不是通用矩阵求逆
 
 FlashQLA 知道矩阵满足以下条件：
 
