@@ -151,20 +151,34 @@ V,U,R\in\mathbb{R}^{C\times D_v},\quad
 H_0\in\mathbb{R}^{D\times D_v}
 $$
 
-主要阶段为：
+整个 chunk 的处理可以归纳为五个阶段：
 
-1. SHAVE：Q/K L2Norm、gate 和累计 decay；
-2. DPU：$KK^T$；
-3. SHAVE：将 causal decay 折叠进 $KK^T$；
-4. DPU：$KH_0$，得到 `s0k`；
-5. DPU：$QH_0$，得到 `s0q`；
-6. DPU：$QK^T$；
-7. SHAVE：$R=\beta(V-\gamma\odot s0k)$；
-8. SHAVE/DPU：求解下三角系统 $LU=R$；
-9. DPU：$O_{intra}=\operatorname{tril}(QK^T)U$；
-10. SHAVE：$O=\gamma\odot s0q+O_{intra}$；
-11. DPU：$\Delta H=K^T(E\odot U)$；
-12. SHAVE：$H_C=\gamma_CH_0+\Delta H$。
+| 阶段 | SHAVE 负责 | DPU 负责 | 阶段产物与作用 |
+|---|---|---|---|
+| 1. 输入准备 | Q/K L2Norm；计算 gate、beta 和累计 decay | - | 归一化后的 `Qn/Kn`，以及 `gamma/egate/beta` |
+| 2. 构造关系矩阵 | 对 Gram 矩阵施加 causal mask 和 decay | `KK^T`、`KH0`、`QH0`、`QK^T` | token 间影响系数，以及旧状态对 key/query 的读取结果 |
+| 3. 求状态修正 | 构造右端项 `R`；执行两个 32-row block 内的前代 | 计算两个 32-row block 之间的耦合 | 解出当前 chunk 每个 token 的有效状态修正 `U` |
+| 4. 生成输出 | 将旧状态贡献和 chunk 内贡献相加并写回 | 计算 chunk 内输出贡献 | 得到当前 chunk 的输出 `O` |
+| 5. 更新状态 | 计算 decay 比例；融合旧状态与状态增量 | 计算整个 chunk 的状态增量 | 得到下一个 chunk 使用的状态 `H_C` |
+
+对应的核心公式按数据流串联如下：
+
+$$
+\begin{aligned}
+G_{KK} &= KK^T, \\
+s_{0k} &= KH_0, \\
+s_{0q} &= QH_0, \\
+G_{QK} &= QK^T, \\
+R &= \beta\odot\left(V-\gamma\odot s_{0k}\right), \\
+LU &= R, \\
+O_{\mathrm{intra}} &= \operatorname{tril}(G_{QK})U, \\
+O &= \gamma\odot s_{0q}+O_{\mathrm{intra}}, \\
+\Delta H &= K^T(E\odot U), \\
+H_C &= \gamma_C H_0+\Delta H.
+\end{aligned}
+$$
+
+其中，`G_KK` 在进入三角求解前还会由 SHAVE 折叠 causal decay。阶段 3 中的 `LU = R` 不是普通 MatMul：block 内存在逐行依赖，因此由 SHAVE 前代；只有两个 32-row block 之间的规则矩阵耦合交给 DPU。
 
 ```mermaid
 flowchart LR
