@@ -583,23 +583,101 @@ NPU 上应使用现有 DMA descriptor 的 `start/wait` 和明确的 buffer owner
 
 ### 5.6 与 FlashQLA 的对应关系
 
-FlashQLA 使用双缓冲 shared memory：
+#### 5.6.1 FlashQLA 如何实现异步流水
+
+FlashQLA 的 Blackwell `fused_fwd.py` 不是在同一个线程中简单地调用一次异步 copy，而是把一个 thread block 明确拆成 producer 和 consumer：
+
+- 96 个 producer threads，分成三组，各自搬运 `Q/K`、`V/beta`、`A/gate`；
+- 三组各 128 threads 的 consumer，分别推进 state、value/update、output 计算；
+- shared memory 中为输入分配两个 stage，chunk $i$ 使用 `i % 2`；
+- `data_is_ready[2]` 表示某个 stage 已装满；
+- `data_is_free[2]` 表示所有 consumer 都不再使用该 stage。
+
+源码中的双 stage 对象包括：
 
 ```python
 q_shared = T.alloc_shared((2, block_S, DK), ...)
 k_shared = T.alloc_shared((2, block_S, DK), ...)
+v_shared = T.alloc_shared((2, block_S, block_DV), ...)
+a_shared = T.alloc_shared((2, block_S, block_S), ...)
+g_shared = T.alloc_shared((2, block_S), ...)
+b_shared = T.alloc_shared((2, block_S), ...)
 ```
 
-并用 `data_is_ready` / `data_is_free` barrier 管理生产者和消费者：
+其所有权协议可以画成：
 
-- `data_is_ready`：输入已经加载完成，可以计算；
-- `data_is_free`：所有消费者已完成，可以覆盖该 stage。
+```mermaid
+sequenceDiagram
+    participant P as Producer threads
+    participant F as data_is_free[slot]
+    participant SM as Shared-memory slot
+    participant R as data_is_ready[slot]
+    participant C as 3 consumer groups
 
-参考 FlashQLA 中的 `flash_qla/ops/gated_delta_rule/chunk/hopper/fused_fwd.py`。
+    P->>F: wait: slot 可覆盖
+    P->>SM: TMA/copy chunk i 的 Q/K/V/A/g/b
+    P->>R: arrive: 数据已就绪
+    C->>R: wait: chunk i 可读取
+    C->>SM: GEMM、gate、state、output
+    C->>F: 三组 consumer 全部 arrive
+    Note over P,C: 此后 producer 才能复用该 slot
+```
 
-NPU 上对应为 DMA event/descriptor 和显式 buffer ownership，而不是 CUDA warpgroup barrier。
+双 stage 使不同 chunk 占用不同 shared-memory slot：
 
-两者思想上的映射为：
+```text
+时间片                 slot 0                         slot 1
+-----------------------------------------------------------------------
+填充                   producer load chunk 0          空闲
+稳态 0                 consumers compute chunk 0      producer load chunk 1
+稳态 1                 producer load chunk 2          consumers compute chunk 1
+稳态 2                 consumers compute chunk 2      producer load chunk 3
+排空                   空闲                           consumers compute chunk 3
+```
+
+关键点不是“双 buffer”这一个动作，而是以下三件事同时成立：
+
+1. producer 与 consumer 是不同的 warp/warpgroup，能并发推进；
+2. TMA 发起 global-memory 到 shared-memory 的异步搬运；
+3. ready/free barrier 保护 slot，避免 producer 覆盖仍在被读取的数据。
+
+consumer 内部还使用 `bar_0` 到 `bar_5` 同步 state、value 和 output 三条计算链。例如 output consumer 生成 `P=QK^T`，value consumer 生成 `Vd`，之后二者通过 barrier 汇合计算 `O += Pg @ Vd`。因此 FlashQLA 同时利用了两种并行：
+
+- **跨 chunk**：producer 加载 chunk $i+1$，consumer 计算 chunk $i$；
+- **同 chunk**：不同 consumer 组并行生成 state/value/output 链上的中间量。
+
+```mermaid
+flowchart LR
+    subgraph NEXT["chunk i+1: producer"]
+        LQ["load Q/K"]
+        LV["load V/beta"]
+        LA["load A/gate"]
+    end
+
+    subgraph CUR["chunk i: consumers"]
+        CS["state consumer"]
+        CV["value consumer"]
+        CO["output consumer: QKᵀ"]
+        CV --> MERGE["Pg × Vd"]
+        CO --> MERGE
+        CV --> CS
+    end
+
+    LQ --> READY["ready[i+1]"]
+    LV --> READY
+    LA --> READY
+    CS --> FREE["free[i]"]
+    CV --> FREE
+    CO --> FREE
+```
+
+#### 5.6.2 NPU 不能照搬什么
+
+FlashQLA 的 consumer 都是 GPU threads，Tensor Core GEMM 由这些 consumers 发起；NPU GDN 则是 SHAVE 执行标量/向量代码并向独立 DPU 提交 MatMul，输入搬运还可能由独立 DMA engine 完成。因此不能照搬 warpgroup 数量、寄存器配额或 CUDA barrier，只能复用它的核心原则：
+
+> 为每个异步生产者明确输出 buffer，并用 ready/free 事件保护该 buffer 的整个生命周期。
+
+思想上的映射为：
 
 | FlashQLA | NPU GDN 目标设计 |
 |---|---|
@@ -611,7 +689,137 @@ NPU 上对应为 DMA event/descriptor 和显式 buffer ownership，而不是 CUD
 | `data_is_ready` | DMA completion / stage ready |
 | `data_is_free` | consumer completion / stage free |
 
-不能直接照搬 FlashQLA 的 warpgroup barrier。NPU 需要沿用本平台已有的 DMA 与 DPU completion 机制。
+#### 5.6.3 NPU 第一层：先做 chunk 内 DPU/SHAVE 重叠
+
+这一层不需要 DMA 双 buffer。把同步的 `dpuMatMulRunW()` 拆开即可：
+
+```mermaid
+sequenceDiagram
+    participant S as SHAVE
+    participant D as DPU
+    participant Q as QKtH16
+    participant R as R buffer
+
+    S->>D: dpuMatMulRun(QKᵀ)
+    activate D
+    par DPU
+        D->>Q: 写 QKtH16
+    and SHAVE
+        S->>R: R = beta × (V - gamma × s0k)
+    end
+    S->>D: dpuMatMulWait()
+    deactivate D
+    S->>Q: 读取 QKtH16，fold decay
+```
+
+其正确性来自 buffer 不相交：DPU 只读 `QnH16/KnH16` 并写 `QKtH16`，同时 SHAVE 只读 `V/s0kH16/gamma/beta_c` 并写 `R`。`wait` 必须放在第一次读取 `QKtH16` 的 decay-folding 循环之前。
+
+NPU 上建议按以下次序实施同类窗口：
+
+```text
+1. QKᵀ DPU              || SHAVE compute R
+2. state-update DPU     || SHAVE write output
+3. KKᵀ DPU              || SHAVE stage Q/H0 to FP16
+```
+
+第一版保持“每个 SHAVE 最多一个 outstanding DPU workload”，不增加 DPU queue depth。
+
+#### 5.6.4 NPU 第二层：再做跨 chunk DMA ping-pong
+
+当第一层稳定且 profile 证明 DDR 搬运值得隐藏后，再为原始输入建立 CMX stage A/B：
+
+本节的 `GdnInputStage`、`startPrefetch()`、`waitReady()` 和 `markFree()` 都是建议接口的伪代码名称，当前仓库中尚不存在这些符号。
+
+```mermaid
+sequenceDiagram
+    participant DMA as DMA engine
+    participant A as CMX stage A
+    participant B as CMX stage B
+    participant S as SHAVE
+    participant D as DPU
+
+    DMA->>A: load chunk 0
+    DMA-->>S: ready(A)
+    par 预取下一块
+        DMA->>B: load chunk 1
+    and 处理当前块
+        S->>D: run MatMul for chunk 0
+        S->>S: independent vector work
+        S->>D: wait MatMul
+        S->>S: finish chunk 0 and state H1
+    end
+    S-->>DMA: free(A)
+    DMA-->>S: ready(B)
+    Note over DMA,D: 下一轮交换 A/B
+```
+
+建议使用一个结构体显式描述 stage，而不是散落的 A/B 指针：
+
+```cpp
+struct GdnInputStage {
+    void* q;
+    void* k;
+    void* v;
+    void* gate;
+    void* beta;
+    DmaDescriptor* descriptors;
+    StageState state;  // FREE, LOADING, READY, IN_USE
+};
+```
+
+稳态控制流为：
+
+```cpp
+startPrefetch(0, stage[0]);
+for (size_t chunk = 0; chunk < numChunks; ++chunk) {
+    GdnInputStage& current = stage[chunk % 2];
+    GdnInputStage& next = stage[(chunk + 1) % 2];
+
+    waitReady(current);
+    if (chunk + 1 < numChunks) {
+        waitFree(next);
+        startPrefetch(chunk + 1, next);
+    }
+
+    processChunkWithDpuShaveOverlap(current, H0T);
+    markFree(current);
+}
+```
+
+这里 `H0T` 仍然只有一份。chunk $i+1$ 的输入可以提前 DMA，但其 `KH0/QH0` 必须等待 chunk $i$ 生成新状态 $H_{i+1}$。因此 NPU 的目标不是同时完成两个 chunk，而是把下一 chunk 的 state-independent 前半段藏到当前 chunk 后半段之下。
+
+#### 5.6.5 推荐的最终三引擎时间线
+
+```text
+时间 ────────────────────────────────────────────────────────────────>
+
+DMA     load C0       load C1                 load C2
+        └─stage A─┘   └────stage B────┘       └─stage A─┘
+
+DPU                    QKᵀ C0   solve/output   QKᵀ C1   solve/output
+                       ██████    ███████████   ██████    ███████████
+
+SHAVE                  prep/R C0  fold/solve   prep/R C1  fold/solve
+                       ████████   ██████████   ████████   ██████████
+
+状态依赖                         produce H1              produce H2
+                                      │                       │
+                                      └── C1 KH0/QH0 可开始   └── C2 可开始
+```
+
+理想情况下，DMA 时间被当前 chunk 的 DPU/SHAVE 计算隐藏，而每个 chunk 内一部分 DPU 时间又被 SHAVE 的独立计算隐藏。实际收益上限分别约为：
+
+$$
+T_{chunk\text{-}internal}\approx\max(T_{DPU},T_{SHAVE\ independent})+T_{dependent}
+$$
+
+以及稳态下：
+
+$$
+T_{per\ chunk}\approx\max(T_{DMA},T_{chunk\ compute}).
+$$
+
+实现时应先落地第一层，因为它只改变等待位置；第二层会改变输入驻留、CMX sizing、DMA descriptor 和 compiler/runtime 接口，必须由 profile 数据证明其必要性。
 
 ### 5.7 Compiler 与 runtime 的实现边界
 
