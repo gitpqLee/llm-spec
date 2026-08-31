@@ -156,7 +156,7 @@ $$
 | 阶段 | SHAVE 负责 | DPU 负责 | 阶段产物与作用 |
 |---|---|---|---|
 | 1. 输入准备 | Q/K L2Norm；计算 gate、beta 和累计 decay | - | 归一化后的 `Qn/Kn`，以及 `gamma/egate/beta` |
-| 2. 构造关系矩阵 | 对 Gram 矩阵施加 causal mask 和 decay | `KK^T`、`KH0`、`QH0`、`QK^T` | token 间影响系数，以及旧状态对 key/query 的读取结果 |
+| 2. 构造关系矩阵 | 将 gate decay 折叠到 `KKt/QKt` 的有效下三角；使用 `QKt` 时再将上三角清零 | `KK^T`、`KH0`、`QH0`、`QK^T` | token 间影响系数，以及旧状态对 key/query 的读取结果 |
 | 3. 求状态修正 | 构造右端项 `R`；执行两个 32-row block 内的前代 | 计算两个 32-row block 之间的耦合 | 解出当前 chunk 每个 token 的有效状态修正 `U` |
 | 4. 生成输出 | 将旧状态贡献和 chunk 内贡献相加并写回 | 计算 chunk 内输出贡献 | 得到当前 chunk 的输出 `O` |
 | 5. 更新状态 | 计算 decay 比例；融合旧状态与状态增量 | 计算整个 chunk 的状态增量 | 得到下一个 chunk 使用的状态 `H_C` |
@@ -178,7 +178,7 @@ H_C &= \gamma_C H_0+\Delta H.
 \end{aligned}
 $$
 
-其中，`G_KK` 在进入三角求解前还会由 SHAVE 折叠 causal decay。阶段 3 中的 `LU = R` 不是普通 MatMul：block 内存在逐行依赖，因此由 SHAVE 前代；只有两个 32-row block 之间的规则矩阵耦合交给 DPU。
+其中，`G_KK` 和 `G_QK` 的有效下三角在使用前还会由 SHAVE 乘上 gate decay。causal mask 并不是同一步完成的：kernel 在构造 `QKtMH16` 时复制下三角并将上三角清零。阶段 3 中的 `LU = R` 不是普通 MatMul：block 内存在逐行依赖，因此由 SHAVE 前代；只有两个 32-row block 之间的规则矩阵耦合交给 DPU。
 
 ```mermaid
 flowchart LR
@@ -211,12 +211,25 @@ $$
 
 彼此独立。`R` 只依赖已经完成的 `s0k`，不依赖 `QKtH16`。
 
+这里不存在名为 `foldDecayIntoQKt()` 或 `computeR()` 的真实函数。下面两个名称只是对原 kernel 中两段内联循环的缩写：
+
+- `fold QKt decay`：读取 DPU 生成的 `QKtH16`，给下三角元素乘 gate decay并写入 `QKt`；
+- `compute R`：读取 `V/s0kH16/gamma/beta_c` 并写入 `R`。
+
 当前逻辑：
 
 ```cpp
 dpuMatMulRunW(mmParams, QKtH16, QnH16, KnH16);
-foldDecayIntoQKt();
-computeR();
+
+// Inline loop: read QKtH16 and fold gate decay into QKt.
+for (...) {
+    QKt[...] = static_cast<float>(QKtH16[...]) * decay;
+}
+
+// Inline loop: R = beta * (V - gamma * s0k).
+for (...) {
+    R[...] = beta_c[...] * (value[...] - gamma[...] * s0kH16[...]);
+}
 ```
 
 建议逻辑：
@@ -224,11 +237,17 @@ computeR();
 ```cpp
 dpuMatMulRun(mmParams, QKtH16, QnH16, KnH16);
 
-// Independent SHAVE work while DPU computes QK^T.
-computeR();
+// This loop does not read QKtH16, QnH16 or KnH16.
+for (...) {
+    R[...] = beta_c[...] * (value[...] - gamma[...] * s0kH16[...]);
+}
 
 dpuMatMulWait(mmParams);
-foldDecayIntoQKt();
+
+// QKtH16 is safe to read only after the wait.
+for (...) {
+    QKt[...] = static_cast<float>(QKtH16[...]) * decay;
+}
 ```
 
 从 `run` 到 `wait` 之间：
