@@ -29,7 +29,7 @@
 Decoder-only 大模型按如下条件概率逐 Token 生成：
 
 $$
-P(x_{1:T})=\prod_{t=1}^{T}P(x_t\mid x_{<t})
+P(x_{1:T})=\prod_{t=1}^{T}P(x_t\mid x_{\lt t})
 $$
 
 生成第 $t+1$ 个 Token 前必须先得到第 $t$ 个 Token：
@@ -160,7 +160,7 @@ Target 一次产生 4 组新 logits：
 可以写成：
 
 $$
-p_i=P(x_{t+i}\mid x_{\leq t},d_{<i})
+p_i=P(x_{t+i}\mid x_{\leq t},d_{\lt i})
 $$
 
 其中 $p_1$ 通常来自验证前已经保存的 Target logits，而本次 Forward 最后一个位置的 logits 可以产生额外的 Bonus Token。
@@ -183,7 +183,7 @@ $$
 M_{ij}=
 \begin{cases}
 0, & j\leq i\\
--\infty, & j>i
+-\infty, & j\gt i
 \end{cases}
 $$
 
@@ -630,7 +630,7 @@ $$
 只有当：
 
 $$
-C_D(K)+C_T(K)<C_T(1)\cdot E[S]
+C_D(K)+C_T(K)\lt C_T(1)\cdot E[S]
 $$
 
 推测解码才真正加速。
