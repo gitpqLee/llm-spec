@@ -23,6 +23,30 @@
 
 现代主流的语言模型（GPT、LLaMA、Qwen、Gemma、Mistral …）几乎都是 **decoder-only Transformer**，从输入到输出的整体数据流：
 
+```mermaid
+flowchart LR
+   A[输入文本] --> B[Tokenizer]
+   B --> C[Token IDs]
+   C --> D[Token Embedding]
+   D --> E[位置编码]
+   E --> F[Transformer Block × N]
+   F --> G[Final Norm]
+   G --> H[LM Head]
+   H --> I[全词表 Logits]
+   I --> J[Temperature / 惩罚项]
+   J --> K[TopK / TopP]
+   K --> L[随机采样或 ArgMax]
+   L --> M[下一个 Token ID]
+   M --> N[追加到序列]
+   N --> F
+   M --> O[Tokenizer Decode]
+   O --> P[输出文本]
+```
+
+其中，Embedding、Transformer Block、Final Norm 和 LM Head 属于模型主体；TopK / TopP 与采样通常属于模型外部的生成策略。每轮最终只选出一个 token，并将它追加到上下文中继续解码。
+
+下面进一步标出模型主体中的张量形状变化：
+
 ```
  token ids  (整数序列,  形状 [B, T])
       │

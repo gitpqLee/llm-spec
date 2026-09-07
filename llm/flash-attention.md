@@ -501,6 +501,384 @@ FlashAttention 的主要价值是降低 HBM 流量和中间存储，而不是降
 
 ---
 
+## 17. OpenVINO NPUW HFA 实现
+
+### 17.1 HFA 是什么
+
+NPUW 中的 HFA 是 **Host Flash Attention**。它沿 KV 序列维切块，逐块计算 Attention，并使用
+online softmax 状态保证结果等价于一次处理完整 KV 序列。
+
+这里的 `Host` 容易引起误解：
+
+- Host/NPUW 负责识别 Attention、选择 tile、准备 tensor view、绑定输入输出和顺序启动 NPU request；
+- NPU 负责 QK、mask、指数、归约、PV、running state 合并和最终归一化；
+- Host 不会把每块的数值结果拿回 CPU 做 softmax 合并。
+
+因此 HFA 可以理解为：
+
+```text
+Host 控制循环 + NPU 执行每个 FlashAttention tile
+```
+
+它与“一个 kernel 内部完成全部 KV tile 循环”的设备端 FlashAttention 不完全相同。HFA 的 KV tile
+循环跨越多个 NPU infer request，tile 之间存在 Host 调度；但每个 tile 的数值计算仍在 NPU 上。
+
+### 17.2 从原始 Attention 到 HFA
+
+原始模型中的 Attention 通常近似为：
+
+```text
+Q ───────────────┐
+     ├─ QKᵀ → Add(mask) → Softmax → PV → output
+past_K + new_K ──┤
+past_V + new_V ──┘
+```
+
+NPUW 启用 HFA 后，不再一次物化完整 `[Lq, Lk]` score，而是构造两类可编译子模型：
+
+```text
+Regular Tile Model
+    输入：Q, K_tile, V_tile, past_acc, past_max, past_sum
+    输出：new_acc, new_max, new_sum
+
+Final Tile Model
+    输入：Q, final_K_tile, final_V_tile, past_acc, past_max, past_sum, mask
+    输出：最终 Attention output
+```
+
+普通 tile 可以复用同一个 compiled model 和 infer request。最后一个 tile 单独使用 final model，原因是它
+需要处理尾部 mask，并把 running output 归一化、转置和 reshape 成原 Attention 的输出格式。
+
+### 17.3 一个 Attention 层的运行流程
+
+假设 KV 长度被切成四块：
+
+```text
+KV tile 0 | KV tile 1 | KV tile 2 | final KV tile 3
+```
+
+执行过程如下：
+
+```text
+Host 初始化状态：
+    acc = 0
+    max = -∞
+    sum = 0
+  │
+  ▼
+NPU Regular Tile 0(Q, K0, V0, state0)
+  │ state1 = (acc1, max1, sum1)
+  ▼
+NPU Regular Tile 1(Q, K1, V1, state1)
+  │ state2 = (acc2, max2, sum2)
+  ▼
+NPU Regular Tile 2(Q, K2, V2, state2)
+  │ state3 = (acc3, max3, sum3)
+  ▼
+NPU Final Tile 3(Q, K3, V3, mask3, state3)
+  │
+  ▼
+归一化后的 Attention output
+```
+
+NPUW 将 regular tile 的输出 tensor 与下一次 regular tile 的输入 tensor 绑定到同一组 state buffer，
+也把这组 buffer 绑定为 final tile 的输入。这样状态留在设备可访问内存中，无需每轮由 CPU 读取、计算
+再写回。
+
+对每个 tile，Host 负责：
+
+1. 根据当前 KV offset 取得 `K_tile`、`V_tile` 和需要的 mask tile；
+2. 条件允许时直接复用完整 tensor，或者创建 tensor view；
+3. 无法 view 时才把对应范围复制到 tile buffer；
+4. 绑定 Q、KV tile 和 running state；
+5. 启动 regular/final NPU infer request；
+6. 等待依赖完成后处理下一 tile。
+
+这里的 tile request 必须顺序执行，因为 tile $i+1$ 依赖 tile $i$ 产生的 `acc/max/sum`。
+
+### 17.4 HFA 中的 online softmax
+
+设前面所有 tile 的状态为：
+
+```text
+past_max = m
+past_sum = l
+past_acc = o
+```
+
+当前 tile 首先计算：
+
+$$
+S_i = QK_i^T + M_i
+$$
+
+然后直接选取旧状态与当前 tile 的共同最大值：
+
+$$
+m' = \max(m, \operatorname{rowmax}(S_i))
+$$
+
+当前 tile 的指数权重为：
+
+$$
+P_i = \exp(S_i-m')
+$$
+
+旧状态需要从旧的最大值基准修正到新基准：
+
+$$
+\alpha = \exp(m-m')
+$$
+
+更新 running sum 和 running accumulator：
+
+$$
+l' = \alpha l + \operatorname{rowsum}(P_i)
+$$
+
+$$
+o' = \alpha o + P_iV_i
+$$
+
+注意，这个实现没有显式计算前文通用公式中的 $\beta$。因为当前 tile 的 $P_i$ 已经直接使用新的
+全局最大值 $m'$ 作为基准，$\exp(\hat m-m')$ 已经隐含在 $\exp(S_i-m')$ 中。
+
+最后一个 tile 完成后：
+
+$$
+O = \frac{o'}{l'}
+$$
+
+这不是把多个局部 Softmax 输出相加，而是每处理一块就把未归一化分子、分母和最大值递推到统一基准。
+
+### 17.5 Non-fused HFA 路径
+
+当：
+
+```json
+"NPUW_ATTN_HFA_FUSED": "NO"
+```
+
+每个 HFA tile 被展开为一个普通 OpenVINO 子图：
+
+```text
+MatMul(Q, Kᵀ)
+  → Add(mask)
+  → ReduceMax + Maximum(past_max)
+  → Subtract + Exp
+  → ReduceSum
+  → Multiply/Add 更新 past_sum
+  → MatMul(P, V)
+  → Multiply/Add 更新 past_acc
+```
+
+final tile 子图再执行：
+
+```text
+Divide(acc, sum)
+  → Transpose
+  → Reshape
+  → Attention output
+```
+
+“Non-fused”表示这些数学操作在图中仍是独立算子，不表示它们在 CPU 上运行。整个 tile 子图仍然被编译
+并交给 NPU 执行，只是会产生更多中间 tensor、设备内存流量和算子调度。
+
+### 17.6 Fused HFA 路径
+
+当：
+
+```json
+"NPUW_ATTN_HFA_FUSED": "YES"
+```
+
+tile 子图中的 Attention 核心被替换成 NPU internal op：
+
+```text
+FlashAttentionTile(
+    query,
+    key_tile,
+    value_tile,
+    running_output,
+    running_max,
+    running_sum,
+    optional_mask,
+    config = {is_head, is_tail}
+)
+```
+
+它输出新的：
+
+```text
+running_output, running_max, running_sum
+```
+
+其中：
+
+- regular tile 通常不带 mask，以减少不必要的 mask 处理；
+- final tile 带 mask，用于处理最后 KV 块中的有效范围；
+- final tile 设置 `is_tail=true`，kernel 内部直接完成最终 `acc/sum`；
+- 外层 final tile 子图检测到 fused 路径后，不再额外插入 `Divide`。
+
+所以 fused 路径的职责划分是：
+
+```text
+Host/NPUW：
+    KV 切块、tensor/view 绑定、mask tile 准备、request 顺序调度
+
+FlashAttentionTile fused kernel：
+    QK、mask、online softmax、PV、running state 合并
+    final tile 中再完成最终归一化
+```
+
+需要特别区分两个层次：
+
+```text
+NPUW_ATTN_HFA_FUSED=YES
+    融合的是“单个 HFA tile 内部”的数学操作
+
+HFA 的整个 KV tile 循环
+    当前仍由 Host 逐个启动 NPU request，不是一次 fused kernel launch
+```
+
+因此 fused HFA 减少了 tile 内部的中间数据和算子开销，但没有消除 tile 之间的 Host 调度边界。
+
+### 17.7 Prefill 与 Decode 中的 HFA
+
+#### Prefill
+
+Prefill 通常有 `Lq > 1`。Q 和 KV 都可能很长，HFA 沿 KV 方向切块，让每次只产生
+`[B, Hq, Lq, tile_size]` 的局部 score，而不产生完整 `[B, Hq, Lq, Lk]` score。
+
+主要收益是：
+
+- 降低峰值中间内存；
+- 降低完整 score/probability 的 DDR 写回和读回；
+- 长 prompt 可以配合 chunk prefill 限制单次模型输入长度。
+
+#### Decode
+
+逐 token decode 通常有：
+
+```text
+Lq = 1
+Lk = prompt tokens + 已生成 tokens
+```
+
+此时 HFA 仍沿越来越长的 KV cache 切块：
+
+```text
+Q_new × KV tile 0 → state1
+Q_new × KV tile 1 → state2
+...
+Q_new × final KV tile → output
+```
+
+Decode 不需要保存巨大的 `Lq × Lk` score，因为 `Lq=1` 时 score 本身只是一行；HFA 在这个阶段的价值
+更偏向于以固定 tile 消费长 KV cache，并为 split-KV/FlashDecoding 风格的执行提供 online softmax 合并。
+但 tile 越多，Host 顺序调度的固定开销也越明显，因此短 context 或并行度很低时不保证一定更快。
+
+要让 generate/decode 阶段进入 fused HFA，关键配置是：
+
+```json
+{
+  "NPUW_LLM_GENERATE_ATTENTION_HINT": "HFA",
+  "NPUW_ATTN_HFA_FUSED": "YES"
+}
+```
+
+仅设置 `NPUW_ATTN_HFA_FUSED=YES` 不够。generate attention 默认是 `STATIC`，必须先用
+`NPUW_LLM_GENERATE_ATTENTION_HINT=HFA` 选择 HFA 路径。模型图还必须匹配 NPUW 可识别的 Attention
+模式，并满足目标 NPU/compiler 对 `FlashAttentionTile` 的支持条件。
+
+### 17.8 HFA 与 block-based KV cache
+
+HFA 和 block-based KV cache 是两个正交层面的优化：
+
+| 优化 | 解决的问题 |
+|------|------------|
+| HFA | 如何分块计算 Attention，并在线合并 softmax 状态 |
+| Block-based KV cache | 历史 K/V 如何分块存储、绑定、增长和复用 |
+
+没有 block cache 时，HFA 可以从一块逻辑连续的 K/V tensor 中按 offset 创建 tile view：
+
+```text
+Continuous KV cache
+└── view(KV[0:B]), view(KV[B:2B]), ...
+```
+
+启用 block cache 后，历史 K/V 已经由多个独立 block 表示。HFA 遍历 block，并在 block 内继续按自己的
+`tile_size` 取 tile：
+
+```text
+KV block 0
+  ├── HFA tile 0
+  └── HFA tile 1
+KV block 1
+  ├── HFA tile 2
+  └── HFA tile 3
+```
+
+因此要求 block size 是 HFA tile size 的整数倍。Block cache 让 prefill 建立的 KV blocks 能被 decoding
+持续复用和追加，减少不断扩展连续 KV tensor 所需的重分配与历史数据复制；HFA 则负责读取这些 blocks
+并完成 Attention。开启 block cache 不会自动开启 fused HFA，反过来也一样。
+
+完整组合通常类似：
+
+```json
+{
+  "NPUW_LLM_PREFILL_HINT": "DYNAMIC",
+  "NPUW_LLM_PREFILL_CHUNK_SIZE": "1024",
+  "NPUW_LLM_PREFILL_ATTENTION_HINT": "HFA",
+  "NPUW_LLM_GENERATE_ATTENTION_HINT": "HFA",
+  "NPUW_ATTN_HFA_FUSED": "YES",
+  "NPUW_LLM_ENABLE_BLOCK_BASED_KV_CACHE": "YES",
+  "NPUW_LLM_ENABLE_PREFIX_CACHING": "NO"
+}
+```
+
+其中 chunk size 必须是正的 2 的幂、小于最大 prompt 长度；block cache 当前要求 chunk prefill，且不能
+与 prefix caching 同时启用。
+
+### 17.9 HFA 数据流总结
+
+```text
+原始 Attention 子图
+  │
+  │ NPUW 识别并选择 HFA
+  ▼
+构造并编译：Regular Tile Model + Final Tile Model
+  │
+  ▼
+Host 准备 Q、KV blocks/views、mask 和初始 running state
+  │
+  ▼
+┌────────────── past KV tile 循环 ──────────────┐
+│ Host 绑定当前 K/V tile                         │
+│        ↓                                      │
+│ NPU tile 计算 QK、online softmax、PV           │
+│        ↓                                      │
+│ NPU 更新 acc/max/sum                           │
+└───────────────────────────────────────────────┘
+  │
+  ▼
+Host 启动 final tile request
+  │
+  ▼
+NPU 处理 final K/V + mask，合并状态并完成归一化
+  │
+  ▼
+Attention output
+```
+
+最核心的结论是：
+
+> HFA 的“Host”负责切块和控制流；Attention 数学计算、跨 tile 的 online softmax 状态更新以及最终归一化
+> 都由编译后的 NPU tile 子模型执行。开启 fused 后，这些数值操作进一步落入 `FlashAttentionTile` kernel，
+> 但整个 KV tile 循环仍由 NPUW 在 Host 侧依次调度。
+
+---
+
 ## 17. 面试要点总结
 
 | 问题 | 答案 |
