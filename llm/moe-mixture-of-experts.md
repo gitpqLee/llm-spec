@@ -93,17 +93,17 @@ MoE 并不是大语言模型时代才出现的概念。
 一个 Pre-Norm Decoder Transformer Block 可简化为：
 
 $$
-H=X+\operatorname{Attention}(\operatorname{Norm}(X))
+H=X+\mathrm{Attention}(\mathrm{Norm}(X))
 $$
 
 $$
-Y=H+\operatorname{FFN}(\operatorname{Norm}(H))
+Y=H+\mathrm{FFN}(\mathrm{Norm}(H))
 $$
 
 MoE 一般只将第二个公式中的 FFN 替换为 MoE：
 
 $$
-Y=H+\operatorname{MoE}(\operatorname{Norm}(H))
+Y=H+\mathrm{MoE}(\mathrm{Norm}(H))
 $$
 
 ```mermaid
@@ -174,8 +174,8 @@ Token 数量:       T = 8
 现代 LLM 常用 SwiGLU：
 
 $$
-\operatorname{FFN}(X)=
-\left(\operatorname{SiLU}(XW_{\text{gate}})\odot XW_{\text{up}}\right)
+\mathrm{FFN}(X)=
+\left(\mathrm{SiLU}(XW_{\text{gate}})\odot XW_{\text{up}}\right)
 W_{\text{down}}
 $$
 
@@ -281,7 +281,7 @@ $R_{t,i}$ 表示 Token $t$ 对专家 $i$ 的路由分数。
 对每个 Token 在专家维度上执行 Top-K：
 
 $$
-\mathcal{S}_t=\operatorname{TopK}(R_t,K)
+\mathcal{S}_t=\mathrm{TopK}(R_t,K)
 $$
 
 得到：
@@ -406,7 +406,7 @@ Top-2 结果为：
 
 $$
 [p_{0,0},p_{0,2}]
-=\operatorname{softmax}([2.0,1.5])
+=\mathrm{softmax}([2.0,1.5])
 \approx[0.622,0.378]
 $$
 
@@ -492,7 +492,7 @@ $$
 再执行：
 
 $$
-Y=\operatorname{ReduceSum}_K(O\odot P)
+Y=\mathrm{ReduceSum}_K(O\odot P)
 $$
 
 其中：
@@ -522,7 +522,7 @@ $$
 $$
 E_i(X_i)=
 \left(
-\operatorname{SiLU}(X_iW_{\text{gate},i})
+\mathrm{SiLU}(X_iW_{\text{gate},i})
 \odot
 X_iW_{\text{up},i}
 \right)W_{\text{down},i}
@@ -745,7 +745,7 @@ $$
 每个 Token 选择多个专家并加权组合：
 
 $$
-y_t=\sum_{i\in\operatorname{TopK}(R_t)}p_{t,i}E_i(x_t)
+y_t=\sum_{i\in\mathrm{TopK}(R_t)}p_{t,i}E_i(x_t)
 $$
 
 质量和稳定性通常更好，但计算、Token 复制量与通信量更高。
