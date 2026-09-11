@@ -615,7 +615,7 @@ $$
 然后直接选取旧状态与当前 tile 的共同最大值：
 
 $$
-m' = \max(m, \operatorname{rowmax}(S_i))
+m' = \max(m, \mathrm{rowmax}(S_i))
 $$
 
 当前 tile 的指数权重为：
@@ -633,7 +633,7 @@ $$
 更新 running sum 和 running accumulator：
 
 $$
-l' = \alpha l + \operatorname{rowsum}(P_i)
+l' = \alpha l + \mathrm{rowsum}(P_i)
 $$
 
 $$
