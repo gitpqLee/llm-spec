@@ -97,17 +97,18 @@
     │          │      │             │           │   │
     │          └──────┴──────┬──────┘           │   │
     │                        ▼                  │   │
-    │              ┌──────────────────┐         │   │
-    │              │  SSM Loop (scan) │  ← SHAVE-only, sequential
-    │              │                  │     fp32,  ~255 μs
-    │              │  state[t] =      │     每步递归依赖
-    │              │    A·state[t-1]  │
-    │              │    + B·x[t]      │
-    │              │                  │
-    │              │  ssm-state:      │
-    │              │  [32,128,128]    │
-    │              │  fp32 (~2MB/L)   │
-    │              └────────┬─────────┘
+    │              ┌──────────────────────────┐   │   │
+    │              │  GatedDeltaNet Loop      │  ← SHAVE-only, sequential
+    │              │  (fused shave kernel)    │     fp32,  ~230 μs elapsed / 3 layers
+    │              │                          │     每步递归依赖
+    │              │  S_t = γ_t · S_{t-1}     │
+    │              │      + β_t · k_t v_t^T   │  ← rank-1 outer product
+    │              │  out_t = S_t · q_t       │     "算完再存":Loop 的 out[1] = S_t
+    │              │                          │
+    │              │  ssm-state:              │
+    │              │  [1,32,128,128]          │
+    │              │  fp32 (~2MB/L)           │
+    │              └────────┬─────────────────┘
     │                       │
     │                  y (attn output)
     │                       │ [B, 1, 4096]
@@ -161,11 +162,63 @@
 
 **Linear-attn 层的关键特征**：
 - **5 个 GEMM**：in_proj_a / b / qkv / z / out_proj（比 self-attn 多一个 `in_proj_z` GLU gate）
-- **无 KV cache**，改用 fixed-size 状态：
-  - `conv-cache [8192, 4]` fp32 — Causal Conv1D 的滑动窗口
-  - `ssm-state [32, 128, 128]` fp32 — SSM 递归状态
+- **无 KV cache**，改用两种 fixed-size 状态（存储语义完全不同,见 1.1.1）：
+  - `conv-cache [1, 8192, 4]` fp32 — Causal Conv1D 的**滑动输入窗口**
+  - `ssm-state [1, 32, 128, 128]` fp32 — SSM 的**融合状态**（Loop 输出）
 - **状态大小与 context length 无关**（长上下文优势的来源）
-- **执行硬件**：GEMM 走 DPU，SSM Loop 走 **SHAVE only**（NPU 上的瓶颈）
+- **执行硬件**：GEMM 走 DPU，Conv1D 走 DPU，**GatedDeltaNet Loop 走 SHAVE only**（NPU 上的瓶颈）
+
+### 1.1.1 Linear-Attn 的两种 Cache 存储机制
+
+Linear-attn 层里同时存在**两种截然不同**的 cache,不能笼统称为"SSM state"。它们的存储语义、更新方式、和 SDPA KV cache 的相似性都不一样,是 GDN 架构设计的核心。
+
+#### 三种 cache 定型对照(基于 IR 反向追溯)
+
+| Cache | 定义链(IR 事实) | 与主 op 的关系 | 类比 |
+|---|---|---|---|
+| **SDPA `past.K / past.V`** | `q_proj / k_proj → RoPE → Concat → present` | **不经过 SDPA MatMul**,投影后就存 | 存"投影后、送 attention 前"的原始输入 |
+| **GDN `past.conv.*`** | `in_proj_qkv → Transpose → Concat → Slice → present` | **不经过 GroupConvolution**,投影后就存 | 和 SDPA KV 同类:存"投影后、送 conv 前"的原始输入 |
+| **GDN `past.ssm.*`** | **Loop.out[1]** → Reshape → present | **是 Loop 内部 recurrence 的输出** | 算完再存,存的是融合过历史的压缩状态 |
+
+从 layer 9 的 IR 直接可见:
+- `Result cache_params.present.conv.7 ← Slice_7 ← Concat(past.conv.7, in_proj_qkv_transposed)` — 完全不经过 GroupConv
+- `Result cache_params.present.ssm.7 ← Reshape ← Loop_11605.out[1]` — 是 GDN Loop 的第二个输出(新 state)
+
+#### 数学根源:为什么两种 cache 更新方式不同
+
+判据是**下游 op 消费每个原始输入的次数**:
+
+**Conv (K=4)** — 每个 x 被 kernel window 覆盖 K 次:
+
+```
+y_t = w0·x_t + w1·x_{t-1} + w2·x_{t-2} + w3·x_{t-3}
+```
+
+`x_{t-3}` 在 `y_{t-3}, y_{t-2}, y_{t-1}, y_t` 时各被读一次(和不同 `w_i` 相乘),K-1 步后才能淘汰。**cache 必须保留原始 x**,直到滑窗划过。这和 SDPA 一样(SDPA 里每个 K_i 会被未来所有 q_t 查询),都是"每个输入被主 op 用多次"的场景。
+
+**SSM (GatedDeltaNet)** — 每个 (k, v) 只贡献一次(rank-1 outer product 累加):
+
+```
+S_t = γ_t · S_{t-1} + β_t · k_t · v_t^T      ← rank-1 update
+out_t = S_t · q_t
+```
+
+`k_t, v_t` 在 `S_t` 生成时被融合进 state,之后**永远不再直接出现**;下一步只需要 `S_{t-1} = S_t`,不需要历史的 `k_i, v_i`。数学上:
+
+```
+S_t = (∏_{i=1..t} γ_i) · S_0 + Σ_{i=1..t} (∏_{j=i+1..t} γ_j) · β_i · k_i v_i^T
+```
+
+任意长历史被压缩成一个固定大小的 `S_t` 矩阵。加法结合律 + rank-1 累加,使得"算完再存"成立 —— 这也是 SSM 空间复杂度 O(1) 的数学来源。
+
+#### 一句话对齐
+
+| 数学特征 | 结果 |
+|---|---|
+| 下游 op 每个输入用**多次**(SDPA 全历史查询 / conv kernel 覆盖 K 次) | **存投影后原始输入**,滚动窗口(conv)或单调增长(SDPA) |
+| 下游 op 每个输入用**一次**并被融合进 state(SSM rank-1 累加) | **存 op 输出的新 state**,固定大小 |
+
+GDN 在同一 layer 里同时用两种机制:short conv 抓局部(用滑窗)、SSM 抓长时(用融合状态)、SiLU gate 门控,构成"短时精细 + 长时记忆 + 门控输出"的复合结构。
 
 ### 1.2 Self-Attn 层内部结构 (标准 GQA — Layer 3/7/11/15/19/23)
 
@@ -289,7 +342,7 @@
 | O proj | 4096→2560 | 4096→2560 | out_proj: 4096→2560 |
 | 额外 gate 分支 | ❌ | ❌ | ✅ in_proj_z: 2560→4096 (SiLU) |
 | Attention 内核 | SDPA (QKᵀ→softmax→·V) | SDPA | **Conv1D + SSM Loop 递归扫描** |
-| 状态存储 | KV cache `[B,H,L,D]` fp16 | 同左 | Conv-cache `[8192,4]` + SSM state `[32,128,128]` fp32 |
+| 状态存储 | KV cache `[B,H,L,D]` fp16(投影后就存) | 同左 | **Conv-cache** `[1,8192,4]` fp32(投影后就存,滑窗)+ **SSM state** `[1,32,128,128]` fp32(**Loop 算完再存**) |
 | Seq 长度复杂度 | O(N²·d) | O(N²·d) | O(N·d²) |
 | 状态大小与 N | **线性增长** | **线性增长** | **恒定**（context-length 无关）|
 
@@ -452,14 +505,16 @@ Qwen3-Next 减少 8 层 (32→24) → 25% 减少
 
 ## 六、Linear-Attn 慢的三大成因（按贡献排序）
 
-### 🔴 成因一：SSM Loop 只能跑在 SHAVE 上（占比 ~55% 慢源）
+### 🔴 成因一：GatedDeltaNet Loop 只能跑在 SHAVE 上（占比 ~55% 慢源）
 
-- **本质**：SSM 是 `state[t] = A·state[t-1] + B·x[t]` 的**顺序递归**，每一步都依赖上一步
-- **硬件后果**：DPU 是 batched 并行硬件，处理不了这种数据依赖 → **只能落到 SHAVE**
-- **性能后果**：
-  - 单层墙钟 ~255 μs（vs SDPA 84-102 μs）
-  - 用 fp32（精度稳定性需要），进一步拖慢
-  - state 张量 `1×32×128×128×4B = 2 MB/层`，每步都要 CMX ↔ DDR 搬运
+- **本质**：GDN 是 `S_t = γ_t · S_{t-1} + β_t · k_t v_t^T` + `out_t = S_t · q_t` 的**顺序递归 + rank-1 update**,每一步的 `S_t` 都依赖上一步的 `S_{t-1}`
+- **硬件后果**：DPU 是 batched 并行硬件,无法处理跨 token 的数据依赖 → **只能落到 SHAVE**
+- **实测数据(3 层合计,基于同一份 profile 的 elapsed 视角)**：
+  - Sum-of-durations(所有 shave events 之和):~3345 μs / 3 层 ≈ 1115 μs/层
+  - **Elapsed(wall clock,多 shave 并行)**:~688 μs / 3 层 ≈ 230 μs/层
+  - 6 个 shave 并行、每 shave active cycles 达 80%,已相当紧凑;LSU stall 只有 14%
+  - 主要瓶颈是 fp32 + `[32,128,128]` state 张量占 512KB / 层的 CMX,限制了 tile 策略
+- **和 SDPA 对比**:SDPA 单层 elapsed ~84 μs;GDN 单层 elapsed ~230 μs → 每层多 ~146 μs
 
 ### 🟡 成因二：多一个 in_proj_z GLU gate GEMM (~30% 慢源)
 
@@ -510,13 +565,15 @@ Linear-attn 在 NPU decode 上是"倒贴"，但设计初衷不是为了 decode�
 
 按预期收益排序：
 
-| 优化点 | 预期收益 | 难度 |
-|---|---:|---|
-| **SSM Loop SHAVE kernel 优化**：fp16 化、多 SHAVE tile 化、scan 内并行 | 单 linear 层 -100 到 -150 μs → 全模型 **+5-8% t/s** | 中高 |
-| **in_proj_z 和 in_proj_qkv 融合**（如果算法允许合成 2560→12288 一次 GEMM）| 单 linear 层 -50 μs → **+2% t/s** | 中 |
-| **SSM state 从 fp32 降到 fp16 / bf16**（如果精度允许）| DMA 减半 + SHAVE 计算减半 → **+3-5% t/s** | 高（需 accuracy 验证）|
-| **Multi-cluster 并行**：SSM Loop 目前单 cluster，可尝试 3 cluster 并行 | 潜在 3× 加速 | 高 |
-| **o_proj / 权重预取调度优化**（消除 layer 7 那种 3577 μs bubble）| 视情况 | 中 |
+| 优化点 | 预期收益 | 难度 | 状态 |
+|---|---:|---|---|
+| **GDN Loop SHAVE kernel 优化**：fp16 化、多 SHAVE tile 化、scan 内并行 | 单 linear 层 -100 到 -150 μs → 全模型 **+5-8% t/s** | 中高 | TODO |
+| **in_proj_z 和 in_proj_qkv 融合**（如果算法允许合成 2560→12288 一次 GEMM）| 单 linear 层 -50 μs → **+2% t/s** | 中 | TODO |
+| **SSM state 从 fp32 降到 fp16 / bf16**（如果精度允许）| DMA 减半 + SHAVE 计算减半 → **+3-5% t/s** | 高（需 accuracy 验证）| TODO |
+| **Multi-cluster 并行**：GDN Loop 目前 3 cluster,可尝试消除 head 轴 tile(把 2 spatial slot 合并) | 视 tile 均衡度 | 高 | 已试 → 收益 -1.1% IRP(见下)|
+| **GDN decode scratch buffer 缩小**(seq_len==1 时 900KB → 64B) | 单 iter -45 μs / IRP **-1.1%** | 低 | ✅ 已实现,`gated_delta_net.cpp:getAuxiliaryBufferType()` 新增 seq_len==1 分支 |
+| **conv-cache 消除多余 GroupConv 列**（`Concat[5]→GroupConv[2]→Slice[1]` → `Slice[4]→GroupConv[1]`)| 理论省 conv 一半计算 | 中 | ❌ 已试 XML POC + compiler pass,均 -7.8% IRP,baseline 拓扑对 NPU tile 策略更友好 |
+| **o_proj / 权重预取调度优化**（消除 layer 7 那种 3577 μs bubble）| 视情况 | 中 | TODO |
 
 ---
 
